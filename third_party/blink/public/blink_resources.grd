@@ -58,6 +58,9 @@
       <include name="IDR_PERMISSION_ICON_MICROPHONE_SVG" file="../renderer/core/html/resources/images/permission_icon_microphone.svg" type="BINDATA" compress="brotli"/>
       <include name="IDR_PERMISSION_ICON_LOCATION_SVG" file="../renderer/core/html/resources/images/permission_icon_location.svg" type="BINDATA" compress="brotli"/>
       <include name="IDR_PERMISSION_ICON_LOCATION_PRECISE_SVG" file="../renderer/core/html/resources/images/permission_icon_location_precise.svg" type="BINDATA" compress="brotli"/>
+      <!-- Float32 MNIST weights: already incompressible, so left uncompressed
+           to keep navigator.digitclassifier's model load allocation-free. -->
+      <include name="IDR_DIGIT_CLASSIFIER_WEIGHTS" file="../renderer/modules/digitclassifier/resources/digit_classifier_weights.bin" type="BINDATA"/>
 
     </includes>
   </release>

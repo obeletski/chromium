@@ -1,0 +1,78 @@
+<!doctype html><meta charset=utf-8><title>dc3</title>
+<style>body{font:21px monospace;margin:8px}#out{white-space:pre-wrap}</style>
+<div id=out>v3 starting…
+</div>
+<script>
+const O=document.getElementById('out');
+const log=s=>{O.textContent+=s+"\n";};
+onerror=(m,u,l)=>log("ONERROR: "+m+" @"+l);
+onunhandledrejection=e=>log("UNHANDLED: "+(e.reason&&e.reason.message||e.reason));
+const TO=(p,ms,tag)=>Promise.race([p,
+  new Promise((_,rj)=>setTimeout(()=>rj(new Error(tag+" TIMEOUT")),ms))]);
+const t0=()=>performance.now();
+function drawOne(){const g=new Float32Array(784);
+  for(let r=5;r<24;r++)for(const c of [13,14])g[r*28+c]=1;return g;}
+function drawSeven(){const g=new Float32Array(784);
+  for(let c=8;c<21;c++)for(const r of [5,6])g[r*28+c]=1;
+  for(let i=0;i<18;i++){const r=6+i,c=20-Math.floor(i*11/18);g[r*28+c]=1;g[r*28+c-1]=1;}return g;}
+function drawZero(){const g=new Float32Array(784);
+  for(let t=0;t<360;t++){const a=t*Math.PI/180,
+    r=Math.trunc(14+8.5*Math.sin(a)),c=Math.trunc(14+6*Math.cos(a));
+    if(r>=0&&r<28&&c>=0&&c<28){g[r*28+c]=1;if(c+1<28)g[r*28+c+1]=1;}}return g;}
+// The model takes 28x28x3 NHWC; the oracle replicates gray across channels.
+function nhwc(g){const x=new Float32Array(2352);
+  for(let i=0;i<784;i++){x[i*3]=x[i*3+1]=x[i*3+2]=g[i];}return x;}
+
+(async()=>{
+  // --- Baseline: does plain WebGPU work here at all? ---
+  log("navigator.gpu: "+(navigator.gpu?"present":"ABSENT"));
+  let adapter=null, dev=null;
+  if(navigator.gpu){
+    try{ const t=t0();
+         adapter=await TO(navigator.gpu.requestAdapter(),12000,"requestAdapter");
+         log("requestAdapter -> "+(adapter?"adapter":"null")+" "+(t0()-t).toFixed(0)+"ms");
+    }catch(e){ log("requestAdapter FAILED: "+e.message); }
+    if(adapter){
+      try{ const info=adapter.info||{};
+           log("  vendor="+(info.vendor||"?")+" arch="+(info.architecture||"?")
+               +" desc="+(info.description||"?"));
+      }catch(e){}
+      try{ const t=t0();
+           dev=await TO(adapter.requestDevice(),12000,"requestDevice");
+           log("requestDevice -> "+(dev?"device":"null")+" "+(t0()-t).toFixed(0)+"ms");
+      }catch(e){ log("requestDevice FAILED: "+e.message); }
+    }
+    if(dev){ // can Dawn compile a trivial WGSL compute shader here?
+      try{ const m=dev.createShaderModule({code:
+             "@compute @workgroup_size(1) fn main() {}"});
+           const ci=await TO(m.getCompilationInfo(),8000,"compileInfo");
+           log("trivial WGSL compiled, msgs="+ci.messages.length);
+      }catch(e){ log("trivial WGSL FAILED: "+e.message); }
+    }
+  }
+  // --- Now the API under test ---
+  log("navigator.digitclassifier: "+(('digitclassifier' in navigator)?"object":"ABSENT"));
+  if(!('digitclassifier' in navigator)){log("stop");return;}
+  let model;
+  try{ const t=t0();
+       model=await TO(navigator.digitclassifier.getModel(),20000,"getModel");
+       log("getModel OK "+(t0()-t).toFixed(0)+"ms");
+  }catch(e){ log("getModel FAILED: "+e.message); log("done"); return; }
+
+  // Expected answers come from tools/reference_infer.py, the CPU oracle.
+  let pass=0, total=0;
+  for(const [name,draw,want] of [["1",drawOne,"1"],["7",drawSeven,"7"],
+                                 ["0",drawZero,"0"],
+                                 ["blank",()=>new Float32Array(784),"5"]]){
+    total++;
+    try{ const t=t0();
+         const got=await TO(model.classify(nhwc(draw())),20000,"classify");
+         const ok=(got===want); if(ok) pass++;
+         log("classify "+name+" -> \""+got+"\" want \""+want+"\" "+
+             (ok?"PASS":"FAIL")+" "+(t0()-t).toFixed(0)+"ms");
+    }catch(e){ log("classify "+name+" FAILED: "+e.message); }
+  }
+  log("=== "+pass+"/"+total+" match the CPU oracle ===");
+  log("done");
+})();
+</script>

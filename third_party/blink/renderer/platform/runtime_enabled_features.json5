@@ -2278,6 +2278,10 @@
       status: "experimental",
     },
     {
+      name: "DigitClassifier",
+      status: "test",
+    },
+    {
       name: "DigitalCredentialsProtocolFilter",
       status: "experimental",
     },

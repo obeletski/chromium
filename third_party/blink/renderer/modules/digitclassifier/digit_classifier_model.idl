@@ -1,0 +1,15 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// A loaded digit classifier. `classify()` takes the 28x28x3 NHWC input the
+// model was trained on (2352 floats, each normalized to [0.0, 1.0]) and
+// resolves with the recognized digit as a string, "0" through "9".
+[
+  Exposed=Window,
+  RuntimeEnabled=DigitClassifier,
+  SecureContext
+] interface DigitClassifierModel {
+  [CallWith=ScriptState, RaisesException]
+  Promise<DOMString> classify(Float32Array input);
+};
