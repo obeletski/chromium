@@ -23,7 +23,14 @@ FloatingWindowToolbarButton::FloatingWindowToolbarButton(Browser* browser)
   // and are recolored from the theme rather than shipped per-theme. Passing the
   // icon to ToolbarButton (rather than setting an image directly) is what keeps
   // it in step with theme and touch-mode changes.
-  SetVectorIcon(kNewWindowIcon);
+  //
+  // The icon is a capital sigma with "AI" overlapping its diagonals. The
+  // overlap is drawn with a PATH_MODE_CLEAR pass between the two: the letter
+  // strokes are laid down once at a wider width in clear mode to punch a gap
+  // out of the sigma, then again at their real width. That is what makes the
+  // sigma read as passing behind the letters instead of merging into them,
+  // which matters because a vector icon is a single colour.
+  SetVectorIcon(kFloatingWindowAiSumIcon);
 
   // TODO(crbug.com/None): Move these strings to generated_resources.grd when
   // this stops being a demo surface. Hardcoded here to avoid requiring
