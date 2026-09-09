@@ -36,13 +36,27 @@ class FloatingWindowUIConfig
 };
 
 // The WebUI for chrome://floating-window: the document rendered inside the
-// floating window opened from the toolbar.
+// floating window opened from the toolbar. It lists the profile's open tabs,
+// grouped by browser window, and under each tab that page's outline — its
+// level 1 and level 2 headings.
 //
 // A WebUIController is the browser-process object that sits behind one WebUI
 // page. Its usual jobs are (a) registering the data source that serves the
 // page's resources and (b) wiring up Mojo interfaces or message handlers that
-// the page can call back into. This one only does (a) — the page is static and
-// has no script, so there is nothing to call back into.
+// the page can call back into. This one only does (a). The page has dynamic
+// content but still no script of its own: everything is rendered into the HTML
+// in C++ while the response is produced, so there is no renderer-side code
+// here that would need a channel back.
+//
+// The two halves of the page come from different places, which is what shapes
+// the .cc. The tab list is browser-process state, read synchronously. The
+// outlines are DOM content living in one renderer per tab, gathered with
+// WebContents::RequestAXTreeSnapshot() and arriving asynchronously — so the
+// response itself is produced asynchronously, which WebUIDataSource's
+// GotDataCallback explicitly permits.
+//
+// Both halves are a snapshot taken when the page loads. The window is rebuilt
+// on every toolbar press, so it refreshes on reopen rather than live.
 class FloatingWindowUI : public content::WebUIController {
  public:
   explicit FloatingWindowUI(content::WebUI* web_ui);

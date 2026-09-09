@@ -6,6 +6,12 @@ Written against branch `floating-window` (based on `f6fd8f0cdc96a`) in
 [`floating-window-alternatives.md`](floating-window-alternatives.md); this
 document only covers what was built.
 
+> **See also.** The page lists each tab's `h1`/`h2` outline, which is the one
+> part of the feature that reaches into other processes and the reason the
+> response is produced asynchronously. That mechanism has its own walkthrough,
+> diagram-heavy, in
+> [`floating-window-page-outlines.md`](floating-window-page-outlines.md).
+
 > **Source links.** Every path below links into
 > [github.com/obeletski/chromium](https://github.com/obeletski/chromium) on the
 > `floating-window` branch. Line anchors were checked against the tree these docs
@@ -17,10 +23,25 @@ document only covers what was built.
 ## 1. What it does
 
 A button in the desktop toolbar, between the extensions area and the profile /
-Incognito indicator. Pressing it opens a floating, non-modal surface rendering
-a real HTML document that says *"I am the floating window"*. Pressing the button
-again, or pressing **Esc**, closes it. The surface stays up while you keep using
-the browser.
+Incognito indicator. Pressing it opens a floating, non-modal surface listing
+**every open tab in the current profile**, grouped by browser window, as a
+table of index / title / URL — and under each tab, that page's **outline: its
+level 1 and level 2 headings**, indented by level. Pressing the button again,
+or pressing **Esc**, closes it. The surface stays up while you keep using the
+browser.
+
+The table is a *snapshot*, taken while the page is being served. It does not
+follow tab changes while the window is open — but the bubble builds a fresh
+`WebContents` on every press (§4), so closing and reopening always re-reads the
+tab strips. §7 covers why it was built that way and what a live version would
+cost.
+
+The two halves of that table come from very different places, and this is the
+single most important thing to hold on to. The **tab list** is browser-process
+state, read synchronously in a few microseconds. The **outlines** are DOM
+content, one renderer process per tab, fetched over IPC and arriving one reply
+at a time. Adding the outlines is what turned this page from a synchronous
+response into an asynchronous one (§7).
 
 Behind a `base::Feature` kill switch, `features::kFloatingWindowToolbarButton`,
 enabled by default.
@@ -43,9 +64,15 @@ enabled by default.
 Three layers, and the interesting thing is how little glue they need.
 
 The single most useful thing to hold in your head: **everything here lives in
-the browser process except the rendered document.** The HTML is a C++ string
-literal compiled into the browser binary; it only becomes a document after
-crossing into a renderer as bytes over a Mojo `URLLoader`.
+the browser process except the rendered document.** The HTML is assembled as a
+`std::string` in the browser — the chrome around the table is a compiled-in
+string literal, the rows are built by walking the profile's tab strips at the
+moment of the request — and it only becomes a document after crossing into a
+renderer as bytes over a Mojo `URLLoader`.
+
+That is also why the tab data needs no IPC of its own. `TabStripModel` is
+browser-process state, and so is the code that renders it; the process boundary
+is crossed exactly once, by the finished HTML.
 
 ```mermaid
 graph TB
@@ -57,7 +84,7 @@ graph TB
     NAV["NavigationRequest +<br/>NavigationURLLoaderImpl"]
     LF["WebUIURLLoaderFactory<br/>type = kNavigation"]
     UI["FloatingWindowUI"]
-    SRC["WebUIDataSource + request filter<br/>returns the C++ string literal"]
+    SRC["WebUIDataSource + request filter<br/>walks the tab strips, returns HTML"]
     BTN -->|"press"| CAS
     CAS -->|"builds the bubble around it,<br/>then LoadInitialURL"| WV
     WV -->|"NavigationController::<br/>LoadURLWithParams"| NAV
@@ -457,6 +484,23 @@ Two consequences worth knowing:
 The widget is shown immediately, at its minimum size, and grows when the
 renderer reports back.
 
+> **A trap this feature actually hit.** Auto-resize can only report the size
+> the *content* wants. The tab table is `width: 100%` with
+> `table-layout: fixed`, which is happy at any width — it has no intrinsic
+> width at all — so the renderer reported the auto-resize **minimum**, and the
+> bubble opened as a narrow column with every title and URL ellipsized down to
+> a few characters. Nothing was wrong with the widget code; there was simply no
+> number for it to grow to. The fix is in the page, not in the view: the `body`
+> rule carries a `min-width` (660px, chosen to sit under the width in
+> `kMaxSize` so the bubble is never clamped horizontally). `kMinSize` stays as
+> a backstop for a future page that forgets to.
+>
+> The height end works the other way and needs no help. Once content exceeds
+> `kMaxSize`, auto-resize stops reporting growth, which leaves the renderer a
+> viewport smaller than its document — so the page scrolls inside a fixed-size
+> window instead of growing without bound. With 24 tabs open the window caps at
+> 560px tall and grows a scrollbar.
+
 ---
 
 ## 7. The WebUI
@@ -480,13 +524,59 @@ Three steps, and only the last one is per-feature:
 `WEB_UI_CONTROLLER_TYPE_DECL/IMPL` declare a per-class type tag — literally the
 address of a static `int` — so a `WebUIController*` can be safely downcast back.
 
+### What changed from the static page
+
+The first version of this feature served one fixed document — a `<p>` reading
+*"I am the floating window"* — from a single `constexpr char[]`. Every request
+produced identical bytes, so the response could be, and was, a `std::string`
+copy of that literal.
+
+Listing tabs breaks exactly one property of that design: **the body is no longer
+the same on every request.** Everything else survives intact, which is why the
+diff is smaller than it sounds.
+
+| | Static page | Tab listing | + page outlines |
+|---|---|---|---|
+| Response bytes | one `constexpr char[]` | `kPageHead` + generated table + `kPageTail` | unchanged |
+| Varies per request | no | yes — by profile, and by whatever the tab strips hold at that instant | also by what each tab's DOM contains |
+| Varies per *profile* | no | yes — the `Profile*` is bound into the request filter | unchanged |
+| Delivery mechanism | `SetRequestFilter()` | unchanged | unchanged |
+| Registration (config, host constant, metrics) | | unchanged | unchanged |
+| Script in the page | none | still none | **still none** |
+| Subresources | none | still none | still none |
+| Data source | — | browser process only | browser process **+ one IPC per tab** |
+| Response produced | synchronously | synchronously | **asynchronously** |
+| New GN deps | — | `//chrome/browser/ui/browser_window`, `//chrome/browser/ui/tabs:tab_strip`, `//url` | `//ui/accessibility:ax_base`, `//mojo/public/cpp/bindings` |
+
+The third column is the outline step. Note what it does *not* change: still no
+script, still no subresources, still the same request filter. The one property
+it does change is the last-but-one row, and that one matters — see
+[Going asynchronous](#going-asynchronous).
+
+The mechanism did not have to change because `SetRequestFilter()` was always a
+*computed* response — the static version simply computed a constant. That is
+the part worth internalising: the escape hatch chosen to avoid `build_webui()`
+overhead for a trivial page turned out to be the same hatch that makes a
+dynamic page possible without any renderer-side code at all.
+
+What did have to change:
+
+- `HandleRequest()` gained a bound `Profile*` first parameter, because the tab
+  data is per-profile and the filter callback otherwise has no handle on one.
+- The single literal split into `kPageHead` / `kPageTail` so the generated
+  markup can be spliced between them.
+- The `<style>` block grew from four rules to a table stylesheet, and the page
+  acquired a `min-width` — which, unexpectedly, is what actually sizes the
+  window (§6).
+- The target gained three GN deps and the file six includes.
+
 ### Serving the HTML
 
-The page is a C++ string literal. The usual shape for a WebUI page is a
-`build_webui()` GN target: HTML/TS/CSS on disk, packed into a `.pak`, reached by
-resource ID via `AddResourcePath()`. For a static one-line page that is a GN
-target, a `.grd` entry, a generated resources map and a build step to produce a
-single `<p>`.
+The usual shape for a WebUI page is a `build_webui()` GN target: HTML/TS/CSS on
+disk, packed into a `.pak`, reached by resource ID via `AddResourcePath()`. That
+target serves *fixed* bytes, which is the wrong shape for a document whose body
+differs on every request — see [Why the table is rendered in
+C++](#why-the-table-is-rendered-in-c-and-not-by-script).
 
 `SetRequestFilter()` is the escape hatch — it lets a source compute a response
 in C++, and it is checked **first** in `WebUIDataSourceImpl::StartDataRequest()`,
@@ -495,9 +585,283 @@ ahead of the resource-ID lookup. It takes two callbacks:
 - `ShouldHandleRequest(path)` — returns `true` unconditionally here, so any path
   under the host serves the same document and a stray trailing segment does not
   produce a blank window.
-- `HandleRequest(path, callback)` — hands back `base::RefCountedString`. The
-  response goes through a *callback* rather than a return value because sources
-  are allowed to answer asynchronously; this one runs it immediately.
+- `HandleRequest(profile, path, callback)` — hands back
+  `base::RefCountedString`. The response goes through a *callback* rather than a
+  return value because sources are allowed to answer asynchronously; this one
+  runs it immediately, since tab strips are plain browser-process state on the
+  same thread.
+
+  The `Profile*` is bound into the callback with `base::BindRepeating` in the
+  `FloatingWindowUI` constructor. A raw pointer is safe because the data source
+  is owned by the `URLDataManager` keyed on that same `BrowserContext`, so the
+  source — and therefore the callback — cannot outlive the profile.
+
+### How the HTML is generated
+
+Three concatenated pieces, in one `base::StrCat()` at the end of
+`HandleRequest()`:
+
+```cpp
+base::StrCat({kPageHead, BuildPageBodyHtml(tabs_), kPageTail})
+```
+
+`kPageHead` runs from `<!doctype html>` through the whole `<style>` block and
+the opening `<body>`; `kPageTail` is `</body></html>`. Neither is templated or
+substituted into — the generated markup is spliced *between* them, never *into*
+them. There is no template engine anywhere in this, and no string-replacement
+pass: nothing scans the literals looking for placeholders.
+
+```mermaid
+graph TB
+  subgraph SYNC["Synchronous — while HandleRequest runs"]
+    HR["HandleRequest(profile, path, callback)"]
+    COL["ProfileBrowserCollection::GetForProfile"]
+    FE["collection->ForEach(fn, Order::kCreation)"]
+    ROW["per tab: window #, index, title, URL, active?<br/><small>copied by value into a TabEntry</small>"]
+    REQ["RequestAXTreeSnapshot, once per live renderer"]
+  end
+
+  subgraph ASYNC["Later — one reply at a time"]
+    OS["OutlineCollector::OnSnapshot(row, AXTreeUpdate&)"]
+    EX["ExtractOutline<br/><small>role == kHeading, level 1 or 2</small>"]
+    DL["kOverallDeadline<br/><small>OneShotTimer</small>"]
+    FIN["OutlineCollector::Finish()<br/><small>guarded, runs once</small>"]
+  end
+
+  subgraph COMPOSE["Composition — browser process, no script anywhere"]
+    BT["BuildPageBodyHtml(tabs)"]
+    BO["BuildOutlineRowsHtml(tab)"]
+    ESC["Escaped(...)<br/><small>base::EscapeForHTML</small>"]
+    OUT["StrCat: kPageHead + body + kPageTail"]
+    CB["callback.Run(RefCountedString)"]
+  end
+
+  HR --> COL --> FE --> ROW --> REQ
+  REQ -.->|"Mojo, per tab"| OS --> EX --> FIN
+  DL -.->|"whatever arrived"| FIN
+  FIN --> BT --> BO --> ESC
+  ESC --> BT
+  BT --> OUT --> CB
+
+  classDef gen fill:#bfe3d0,stroke:#1e6b45,stroke-width:1.5px,color:#0d3b26
+  classDef late fill:#fdecc8,stroke:#8a6100,stroke-width:1.5px,color:#4a3400
+  class BT,BO gen
+  class OS,EX,DL,FIN late
+```
+
+Each composition function returns a `std::string` that its caller appends;
+nothing is written through an output parameter or a stream.
+
+**`base::StrCat()` and `base::StrAppend()`, not `operator+` or `<<`.** Both take
+a `span<const std::string_view>` and size the result once before copying, so an
+eight-fragment row costs one allocation rather than seven temporaries. It also
+keeps the row template readable as a single braced list, which matters when the
+literal fragments are HTML with escaped quotes in them. The idiom is worth
+recognising: `StrCat` builds a new string, `StrAppend` appends into an existing
+one, and both live in `base/strings/strcat.h`.
+
+**Numbers and plurals are inline ternaries.** `base::NumberToString()` for the
+counts, and `count == 1 ? " tab" : " tabs"` for agreement. Real production code
+would reach for `l10n_util::GetPluralStringFUTF16()` and an `IDS_` message,
+because plural rules are not two-branch in most languages — this checkout
+deliberately skips `IDS_` strings (see the repo `CLAUDE.md`), so the English
+form is hardcoded with the same TODO the rest of the feature carries.
+
+**Escaping happens at the leaves, once.** Two overloads of a local `Escaped()`
+wrap `base::EscapeForHTML()` — one taking `std::u16string_view` (titles, via
+`base::UTF16ToUTF8`) and one taking `std::string_view` (URL specs). The row
+builder calls it on every interpolated value, including inside the `title=`
+attribute. Nothing else in the file touches untrusted text, so there is no path
+that skips it.
+
+### Going asynchronous
+
+The tab list is browser-process state. The outlines are not: `h1` and `h2`
+elements live in each tab's DOM, in a different process, and the browser has no
+copy. Something has to ask, and the answer arrives later.
+
+`SetRequestFilter()` already permits that. Its response is handed back through a
+`GotDataCallback` precisely because "a data source is allowed to answer
+asynchronously (reading from disk, waiting on a service)" — the static page and
+the tab table both simply ran it inline. Now it is moved into an
+`OutlineCollector` and run once the replies settle. **No placeholder document,
+no second navigation, and still no script in the page.**
+
+```mermaid
+graph LR
+  HR["HandleRequest"] -->|"synchronous"| TL["tab list<br/><small>ProfileBrowserCollection → TabStripModel</small>"]
+  HR -->|"one IPC per tab"| RS["renderers<br/><small>RequestAXTreeSnapshot</small>"]
+  TL --> OC["OutlineCollector<br/><small>holds the GotDataCallback</small>"]
+  RS -.->|"replies, later"| OC
+  DL["kOverallDeadline<br/><small>2s backstop</small>"] -.-> OC
+  OC -->|"once"| DOC["the composed HTML"]
+
+  classDef pick fill:#bfe3d0,stroke:#1e6b45,stroke-width:1.5px,color:#0d3b26
+  class OC pick
+```
+
+Four things carry the design, and they are covered in depth — with the full
+sequence diagram, the collector's state machine, the ownership graph and the
+failure-mode table — in
+[`floating-window-page-outlines.md`](floating-window-page-outlines.md):
+
+- **a "still issuing" sentinel** on the pending count, so a snapshot that
+  completes inline cannot publish a page built from half the tabs;
+- **a deadline**, because `mojo::WrapCallbackWithDefaultInvokeIfNotRun` fires on
+  callback *destruction* and so does not cover a renderer that is alive and
+  simply never answers — the case that would otherwise leave the window blank
+  forever;
+- **`Finish()` guarded to run exactly once**, since it is reachable from both
+  the last reply and the timer, and `GotDataCallback` is a `OnceCallback`;
+- **ref-counting**, because the reply callbacks and the collector's own timer
+  are independent owners; and `TabEntry` holding titles and URLs *by value*, so
+  a tab closed mid-gather cannot dangle.
+
+### Reading headings out of an accessibility tree
+
+The outline comes from `WebContents::RequestAXTreeSnapshot()`, not from running
+script in the page. An `AXTreeUpdate` is a **flat `std::vector<AXNodeData>`**,
+serialized in document order, so reading it straight through yields headings in
+the order they appear — no recursion needed.
+
+Three traps, each of which costs a debugging cycle if you meet it the hard way,
+and all three are worked through in the outlines document:
+
+1. **Heading level is only serialized under `kExtendedProperties`.** Without
+   that AX mode flag you still get heading nodes — they just all report level 0,
+   so an h1/h2 filter silently drops every one.
+2. **"Level 1 and 2" is not `querySelectorAll("h1, h2")`.** `aria-level` wins
+   when present, so a `<div role="heading" aria-level="2">` counts and an
+   `<h1 aria-level="4">` does not.
+3. **An accessible name is not `textContent`.** It is computed, so it carries
+   source-line whitespace and omits `<script>` content.
+
+#### The markup it emits
+
+Abridged from a real run — long `file://` URLs cut, `title=` attributes elided
+where they repeat the cell text:
+
+```html
+<h1>Open tabs <span class="count">5 tabs in 2 windows</span></h1>
+<table><thead><tr><th class="idx">#</th><th>Title</th><th>URL</th></tr></thead>
+<tbody><tr><th scope="colgroup" colspan="3">Window 1 · 3 tabs</th></tr>
+<tr class="tab" aria-current="true"><td class="idx">1</td><td>Quarterly report — draft</td><td class="url">file:///…/a.html</td></tr>
+<tr class="hd lvl1"><td class="idx"></td><td colspan="2">Quarterly Report</td></tr>
+<tr class="hd lvl2"><td class="idx"></td><td colspan="2">Revenue</td></tr>
+<tr class="hd lvl2"><td class="idx"></td><td colspan="2">Costs &amp; risks</td></tr>
+<tr class="hd lvl1"><td class="idx"></td><td colspan="2">Appendix</td></tr>
+<tr class="tab"><td class="idx">2</td><td>Aria levels</td><td class="url">file:///…/c.html</td></tr>
+<tr class="hd lvl1"><td class="idx"></td><td colspan="2">ARIA level 1</td></tr>
+<tr class="hd lvl2"><td class="idx"></td><td colspan="2">ARIA level 2</td></tr>
+</tbody>
+<tbody><tr><th scope="colgroup" colspan="3">Window 2 · 1 tab</th></tr>
+<tr class="tab" aria-current="true"><td class="idx">1</td><td>No headings here</td><td class="url">file:///…/d.html</td></tr>
+<tr class="hd note"><td class="idx"></td><td colspan="2">no level 1 or 2 headings</td></tr>
+</tbody>
+</table>
+```
+
+(`title=` attributes carrying the untruncated text are elided above; every
+title, URL and heading cell has one.)
+
+Four structural choices are doing work there.
+
+- **One `<tbody>` per browser window.** A `<tbody>` is the standard way to group
+  rows in a table that has more than one logical section, and it lets the group
+  header be a real `<th scope="colgroup">` rather than a styled `<td>`. Screen
+  readers announce the grouping; the alternative (a separate `<table>` per
+  window) would let the columns drift out of alignment between windows.
+- **Outline entries are rows of the same table**, spanning the title and URL
+  columns, rather than a nested `<ul>` inside the title cell. A nested list
+  would have to opt out of the `nowrap` / ellipsis rules the cells rely on, and
+  it would break the alignment of the index column. Indent comes from the
+  `lvl1` / `lvl2` class, so the level is in the markup rather than baked into
+  whitespace.
+- **`aria-current="true"` marks the active tab**, and the CSS hangs *both* the
+  bold weight and the `▸` marker off that same attribute selector
+  (`tr[aria-current="true"]`). There is deliberately no parallel `class="active"`
+  — one source of truth means the visual state and the accessible state cannot
+  disagree.
+- **Per-window indices restart at 1**, because they are tab-strip positions, not
+  a global ordinal. The header row carries the window's own tab count so the
+  numbering reads unambiguously.
+
+The `note` rows distinguish two states that would otherwise look identical:
+*"no level 1 or 2 headings"* means the snapshot came back and the page has
+none; *"outline unavailable"* means it never came back — a discarded tab, a
+dead renderer, or the deadline. Collapsing them into one message would hide
+the difference between "this page has no structure" and "we could not read
+it".
+
+#### The stylesheet the markup relies on
+
+The generated markup is deliberately plain — no inline `style=` attributes, no
+wrapper `<div>`s. Everything visual is four rules in `kPageHead`, and three of
+them are load-bearing rather than decorative:
+
+| Rule | Why it exists |
+|---|---|
+| `body { min-width: 660px }` | the only thing giving auto-resize a width to grow to (§6) |
+| `table { table-layout: fixed; width: 100% }` + `.url { width: 45% }` | with the default `auto` layout a cell sizes to its content, so `text-overflow` would never have an overflow to act on and one long URL would push the window to `kMaxSize` |
+| `th, td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }` | the actual truncation; the full value stays reachable in the `title=` tooltip |
+| `tr.tab td { border-top: … }` | the separator moved off `th, td` when outline rows arrived: a border on every row drew a line under each heading too, turning the outline into a grid. One line per tab, with its outline hanging below it |
+| `tr.hd.lvl2 td:last-child { padding-left: 34px }` | the indent is on the *cell*, not the row, because the row also holds the empty index cell that keeps the numbering column aligned |
+| `color-mix(in srgb, canvastext 55%, canvas)` | muted greys and border tones derived from the system colors, so they follow the light/dark theme instead of being hardcoded to one of them |
+
+`content: "\25B8"` on `tr[aria-current="true"] .idx::after` supplies the active
+marker. A background tint would have been the obvious choice and is the wrong
+one here: any fixed tint fights the system `canvas` color in one of the two
+themes, whereas a glyph inherits `currentColor`.
+
+Two empty states short-circuit before any of this. `GetForProfile()` returning
+null yields *"No browser windows for this profile."*; zero `TYPE_NORMAL` windows
+yields *"No open tabs."* Both are a single `<p class="empty">` — no table
+skeleton with nothing in it.
+
+#### Where the rows come from
+
+```
+ProfileBrowserCollection::GetForProfile(profile)
+  -> ForEach(fn, Order::kCreation)          // one call per browser window
+       -> BrowserWindowInterface::GetTabStripModel()
+            -> count(), GetWebContentsAt(i), active_index()
+                 -> WebContents::GetTitle(), GetLastCommittedURL()
+```
+
+Four choices in that chain are worth pausing on.
+
+- **`ProfileBrowserCollection`, not a global list.** `BrowserList` no longer
+  exists in this tree; window enumeration now goes through
+  [`chrome/browser/ui/browser_window/public/`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h).
+  Taking the *per-profile* collection is what keeps an Incognito window's
+  floating window from listing regular-profile tabs, and it falls straight out
+  of the data source already being registered per `BrowserContext`.
+  `GetForProfile()` is a `KeyedService` lookup and **can return null**, so it is
+  null-checked.
+- **`ForEach()`, not `GetAllBrowserWindowInterfaces()`.** The callback form
+  exists specifically so a window destroyed mid-iteration cannot leave a
+  dangling pointer behind (crbug.com/405910169). The header says so directly.
+- **`Order::kCreation`, not `kActivation`.** Activation order is runtime state
+  that changes whenever the user focuses a window, so an activation-ordered
+  table would reshuffle itself between openings for no reason the user could
+  see. The same header warns against activation order for anything but
+  presentation.
+- **`GetLastCommittedURL()`, not `GetVisibleURL()`.** The visible URL is what
+  the omnibox shows, which during a pending navigation is a destination the tab
+  has not reached. A listing of current state wants what the tab is actually
+  displaying.
+
+Only `TYPE_NORMAL` windows are listed. Popups, PWA windows, DevTools windows and
+picture-in-picture windows each technically own a one-entry tab strip, and
+including them would list "tabs" that no user thinks of as tabs.
+`IsDeleteScheduled()` drops windows mid-teardown — the same pair of filters
+`ProfileBrowserCollection::FindTabbedBrowser()` applies internally.
+
+> **Escaping is not optional here.** A page title is attacker-controlled — a
+> site picks its own `<title>` — and this response is served on a `chrome://`
+> origin. Titles and URLs go through `base::EscapeForHTML()`
+> ([`base/strings/escape.h:69`](https://github.com/obeletski/chromium/blob/floating-window/base/strings/escape.h#L69)), which covers `&`, `<`, `>`, `"` and `'`,
+> in both the cell text and the `title=` tooltip attribute.
 
 > **A trap.** `SetResourcePathToResponse()` looks like a shorter way to do this
 > and is used exactly that way in content's own browsertests
@@ -507,7 +871,7 @@ ahead of the resource-ID lookup. It takes two callbacks:
 > Whether it worked would depend on which loading path was active. The request
 > filter is honoured unconditionally.
 
-### Why there is no script in the page
+### Why the table is rendered in C++, and not by script
 
 Data sources get a default CSP from `URLDataSource::GetContentSecurityPolicy()`
 ([`content/public/browser/url_data_source.cc:64`](https://github.com/obeletski/chromium/blob/floating-window/content/public/browser/url_data_source.cc#L64)). For a trusted `chrome://`
@@ -520,10 +884,48 @@ source:
 | `require-trusted-types-for` | `'script'` | ditto |
 | `object-src`, `child-src`, `frame-ancestors` | `'none'` | irrelevant here |
 
-So the styling is inline and there is deliberately no script — one would be
-silently blocked at runtime. Colors are CSS system colors plus
-`color-scheme: light dark`, so the page follows the OS/browser theme without the
-browser pushing any color values into it.
+So the styling is inline and there is deliberately no script. Note the shape of
+the `script-src` value, because it decides the whole design of this page:
+
+- **Inline `<script>` is blocked.** Not reported anywhere convenient, either —
+  it simply does not run. Any attempt to build the table client-side from an
+  inline block would fail silently.
+- **A same-origin `.js` file would be allowed**, because of the `'self'`. The
+  request filter can serve one as easily as it serves the HTML.
+
+So a live-updating table *is* reachable, and it is what real Chromium WebUI
+does. It costs: a served `main.js`, a `WebUIMessageHandler` (or a Mojo
+interface) on the C++ side, `TabStripModelObserver` +
+`BrowserCollectionObserver` subscriptions to know when to push, and DOM built
+with `createElement` rather than `innerHTML` because
+`require-trusted-types-for 'script'` is on.
+
+This page takes the cheaper route instead: it composes the whole document in
+the browser process. For the tab list that is nearly free, since the browser
+already holds it.
+
+The outlines complicate the picture without changing the conclusion. Those
+*aren't* browser-process state — they are DOM content in one renderer per tab —
+so something has to cross the process boundary either way. The question is only
+what crosses and in which direction. Script in this page would mean the page
+asking the browser, the browser asking each renderer, and the answers coming
+back through two hops and a message handler. An accessibility-tree snapshot
+skips the middle: the browser asks each renderer directly, and this page is
+still served as finished bytes with nothing to run. That is why the CSP never
+becomes a problem — the document stays inert no matter how dynamic its content
+gets.
+
+The trade is honest and worth naming — the table is a snapshot, and it goes
+stale if you leave the window open while tabs change. What makes that tolerable
+is that the surface is rebuilt from scratch on every press (§4 —
+`CreateAndShow()` constructs a new `views::WebView`, hence a new `WebContents`
+and a new navigation), so reopening is the refresh gesture.
+
+Colors are CSS system colors plus `color-scheme: light dark`, so the page
+follows the OS/browser theme without the browser pushing any color values into
+it. The muted greys are `color-mix(in srgb, canvastext 55%, canvas)` for the
+same reason: derived from the system colors, so they track the theme instead of
+being hardcoded to one of light or dark.
 
 ### The metrics registration a new WebUI host requires
 
@@ -580,6 +982,47 @@ The toggle screenshots are byte-identical (md5) to the first-open and
 Esc-closed captures, so both paths reach exactly the same state. No
 `FATAL`/`DCHECK`/CSP errors in the browser log.
 
+### The tab table
+
+Same harness. Two profiles' worth of state was set up by launching windows and
+tabs directly, and the page was also driven standalone by navigating a tab to
+`chrome://floating-window` over CDP `Page.navigate` (`/json/new` refuses
+`chrome://` URLs, and `--headless` accepts only one target, so neither is a
+route to it).
+
+| Step | Result |
+|---|---|
+| 3 tabs in window 1, 1 tab in window 2, click the icon | *"4 tabs in 2 windows"*, two `<tbody>` groups, correct per-window indices |
+| a title containing `&`, `"` and `<script>` | rendered as literal text; `&amp;`, `&quot;`, `&lt;script&gt;` in both the cell and the `title=` attribute |
+| a page with no `<title>` | falls back to the filename, via `WebContents::GetTitle()` |
+| the active tab of each window | bold, `aria-current="true"`, `▸` marker |
+| 24 tabs in one window | window caps at 560px tall, page scrolls internally |
+| press Esc | bubble region is byte-identical (md5) to the pre-open capture |
+
+### Page outlines
+
+Same harness, with pages written to pin down the heading-level rules rather
+than just to have headings.
+
+| Step | Result |
+|---|---|
+| `h1`, `h2`, `h3`, `h2`, `h1` in one page | the `h3` is excluded; the other four appear in document order at the right indents |
+| `<h1>` nested one and two `<section>`s deep | all report level 1 — `GetComputedHeadingOffset()` is off by default, so tag number wins |
+| `<div role="heading" aria-level="2">` | included as a level 2 |
+| `<div role="heading" aria-level="4">` | excluded |
+| `<h2>` split across three source lines | collapses to one line |
+| heading containing `<script>alert(1)</script>` | script contributes no accessible text; the rest renders escaped |
+| page with no headings | *"no level 1 or 2 headings"* |
+| **a tab whose renderer busy-loops for 60s** | window still opens; that tab reads *"outline unavailable"*, every other tab renders its outline normally |
+
+That last row is the one worth having run. It is the failure
+`WrapCallbackWithDefaultInvokeIfNotRun` does *not* catch, and without
+`kOverallDeadline` the floating window would have stayed blank indefinitely.
+
+No CSP violations, `FATAL` or `DCHECK` output in the browser log across all
+runs. `gn check` passes on `//chrome/browser/ui/webui/floating_window` with the
+four new deps.
+
 Also clean: `gn check` on both new targets, `git cl format`,
 [`tools/metrics/histograms/validate_format.py`](https://github.com/obeletski/chromium/blob/floating-window/tools/metrics/histograms/validate_format.py), and `pretty_print.py --presubmit`
 on both edited XML files.
@@ -612,6 +1055,23 @@ after load, and without it the PDF can be printed while they are still empty.
 - **No tests.** A `FloatingWindowToolbarButton` browser test asserting
   open/toggle/Esc would be the natural next step; the interaction is exactly
   what `InteractiveBrowserTest` covers.
+- **The table is a snapshot, not a live view.** It is read once while the
+  response is composed, so it goes stale if tabs change while the window stays
+  open; reopening is the refresh. §7 spells out what a live version would take.
+  Nothing in the current shape blocks it — the request filter can serve a
+  same-origin `.js`, which `script-src ... 'self'` already permits.
+- **Opening the window now costs one IPC per tab.** The response is not
+  composed until every tab has answered or `kOverallDeadline` (2s) expires, so
+  with many tabs the bubble appears measurably later than it did when the page
+  was pure browser-process state. Nothing here batches or caches those
+  snapshots between openings.
+- **Outlines are level 1 and 2 only, capped at 12 per tab**, with a `+ N more`
+  row beyond that. Deeper levels are dropped rather than folded in.
+- **Cross-origin iframes contribute nothing**, by choice of
+  `kSameOriginDirectDescendants`. A page whose real content is in a same-site
+  iframe will look emptier than it is.
+- **Only `TYPE_NORMAL` windows appear.** Popups, PWA windows, DevTools and
+  picture-in-picture windows own tab strips too and are deliberately skipped.
 - **No histogram for usage.** The metrics files were touched only to satisfy the
   WebUI-host registration, not to record how often the button is pressed.
 - **Not user-pinnable.** A deliberate consequence of choosing a hardcoded child

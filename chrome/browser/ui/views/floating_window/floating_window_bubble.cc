@@ -23,11 +23,26 @@ namespace floating_window {
 namespace {
 
 // Bounds handed to the renderer's auto-resize mode (see the sizing chain in
-// CreateAndShow below). The page is a single line of text, so in practice the
-// rendered size lands near the minimum; the maximum only stops a future edit to
-// the page from producing an unbounded window.
-constexpr gfx::Size kMinSize(220, 60);
-constexpr gfx::Size kMaxSize(600, 400);
+// CreateAndShow below).
+//
+// Both ends are load-bearing now that the page renders a table of open tabs,
+// whose height grows with the tab count and is not known here.
+//
+// The maximum is a real clamp rather than a formality. Auto-resize stops
+// reporting growth once content exceeds it, which leaves the renderer with a
+// viewport smaller than the document — so the page scrolls internally instead
+// of the window growing without bound. Anyone with thirty tabs gets a
+// scrollable 560px-tall window, not one taller than the display.
+//
+// The minimum keeps the "no open tabs" and single-row cases from rendering as a
+// sliver. Note that the *width* the window actually takes is set by the page,
+// not here: the table is fluid, so auto-resize has no intrinsic width to report
+// and would otherwise settle on this minimum with every column ellipsized. The
+// page carries a `min-width` for exactly that reason (see the body rule in
+// floating_window_ui.cc). This stays as a backstop for a future page that
+// forgets to.
+constexpr gfx::Size kMinSize(420, 100);
+constexpr gfx::Size kMaxSize(760, 560);
 
 }  // namespace
 

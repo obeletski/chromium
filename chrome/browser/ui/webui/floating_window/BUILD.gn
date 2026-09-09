@@ -16,6 +16,24 @@ source_set("floating_window") {
   deps = [
     "//base",
     "//chrome/browser/profiles:profile",
+
+    # ProfileBrowserCollection / BrowserWindowInterface, for enumerating the
+    # profile's browser windows, and TabStripModel for their tabs. Depending
+    # back on these from a //chrome/browser/ui/webui source_set is normal --
+    # //chrome/browser/ui/browser_window is deliberately dependency-free within
+    # //chrome so that features can point at it without cycles (see the comment
+    # atop its BUILD.gn). //chrome/browser/ui/webui:chrome_web_contents_handler
+    # is the nearest precedent, with the same pair of deps.
+    "//chrome/browser/ui/browser_window",
+    "//chrome/browser/ui/tabs:tab_strip",
     "//content/public/common",
+
+    # Reached transitively through //content/public/browser today, so gn check
+    # passes without them. Listed anyway because this target includes their
+    # headers directly: WrapCallbackWithDefaultInvokeIfNotRun for the snapshot
+    # replies, and AXTreeUpdate/AXNodeData for reading headings out of them.
+    "//mojo/public/cpp/bindings",
+    "//ui/accessibility:ax_base",
+    "//url",
   ]
 }
