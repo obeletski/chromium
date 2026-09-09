@@ -83,6 +83,7 @@
 #include "chrome/browser/contextual_cueing/internals/contextual_cueing_internals_ui.h"
 #include "chrome/browser/ui/tabs/tab_group_home/tab_group_home_ui.h"
 #include "chrome/browser/ui/webui/content_annotator_internals/content_annotator_internals_ui.h"
+#include "chrome/browser/ui/webui/floating_window/floating_window_ui.h"
 #include "chrome/browser/ui/webui/webui_toolbar/webui_toolbar_ui.h"
 #include "chrome/browser/ui/webui_browser/webui_browser_ui.h"
 #if !BUILDFLAG(IS_CHROMEOS)
@@ -336,6 +337,7 @@ void RegisterChromeWebUIConfigs() {
   map.AddWebUIConfig(
       std::make_unique<
           content_annotator_internals::ContentAnnotatorInternalsUIConfig>());
+  map.AddWebUIConfig(std::make_unique<FloatingWindowUIConfig>());
   map.AddWebUIConfig(std::make_unique<media_router::AccessCodeCastUIConfig>());
   map.AddWebUIConfig(std::make_unique<actor::ui::ActorOverlayUIConfig>());
   map.AddWebUIConfig(std::make_unique<AppServiceInternalsUIConfig>());

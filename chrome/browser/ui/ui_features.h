@@ -373,6 +373,11 @@ BASE_DECLARE_FEATURE(kToolbarGlicButtonResizing);
 // Currently only used on MacOS as that's the only platform we can
 // be sure the user has an easy remedy. See crbug.com/493148224.
 BASE_DECLARE_FEATURE(kOSCryptAsyncAvailabilityInfoBar);
+// Shows a toolbar button, between the extensions area and the profile /
+// Incognito indicator, that toggles a floating chrome://floating-window
+// bubble. Enabled by default; this exists as a kill switch.
+BASE_DECLARE_FEATURE(kFloatingWindowToolbarButton);
+
 BASE_DECLARE_FEATURE(kDeferLayoutDuringBrowserStartup);
 
 }  // namespace features

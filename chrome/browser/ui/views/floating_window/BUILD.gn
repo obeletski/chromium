@@ -1,0 +1,25 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+assert(is_win || is_mac || is_linux || is_chromeos)
+
+source_set("floating_window") {
+  sources = [
+    "floating_window_bubble.cc",
+    "floating_window_bubble.h",
+  ]
+  public_deps = [
+    "//base",
+    "//ui/base",
+    "//ui/views",
+  ]
+  deps = [
+    "//chrome/browser/profiles:profile",
+    "//chrome/common",
+    "//ui/base/mojom:ui_base_types",
+    "//ui/gfx/geometry",
+    "//ui/views/controls/webview",
+    "//url",
+  ]
+}

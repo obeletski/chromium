@@ -472,6 +472,7 @@ chromium-metrics-reviews@google.com.
   <variant name=".file-manager"/>
   <variant name=".files-internals"/>
   <variant name=".flags"/>
+  <variant name=".floating-window"/>
   <variant name=".floating-workspace"/>
   <variant name=".focus-mode-media"/>
   <variant name=".focus-mode-player"/>

@@ -97,6 +97,7 @@
 #include "chrome/browser/ui/views/toolbar/back_forward_button.h"
 #include "chrome/browser/ui/views/toolbar/browser_app_menu_button.h"
 #include "chrome/browser/ui/views/toolbar/chrome_labs/chrome_labs_coordinator.h"
+#include "chrome/browser/ui/views/toolbar/floating_window_toolbar_button.h"
 #include "chrome/browser/ui/views/toolbar/home_button.h"
 #include "chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.h"
 #include "chrome/browser/ui/views/toolbar/reload_button.h"
@@ -573,6 +574,20 @@ void ToolbarView::Init() {
                                   .set_left(kGlicButtonMargin)
                                   .set_right(kInsideBorderAroundGlicButtons));
     UpdateGlicButtonVisibility();
+  }
+
+  // Position in the toolbar is decided purely by where AddChildView() is called
+  // relative to its siblings: the layout manager lays children out in child
+  // order. Adding here — after the extensions container, its divider and the
+  // pinned-actions container, and immediately before `avatar_` — is what puts
+  // the icon between the extensions area and the profile / Incognito indicator.
+  //
+  // Because the button is added directly rather than through an ActionItem in
+  // PinnedToolbarActionsContainer, it is not user-pinnable or re-orderable, but
+  // its position is fixed and does not depend on a pref.
+  if (base::FeatureList::IsEnabled(features::kFloatingWindowToolbarButton)) {
+    floating_window_button_ =
+        AddChildView(std::make_unique<FloatingWindowToolbarButton>(browser_));
   }
 
   if (!features::IsWebUIAvatarButtonEnabled()) {

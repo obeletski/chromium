@@ -56,6 +56,7 @@ class ExtensionsToolbarButton;
 class ExtensionsToolbarDesktop;
 class HomeButton;
 class ExtensionsToolbarCoordinator;
+class FloatingWindowToolbarButton;
 class MediaToolbarButton;
 class ReloadButton;
 class WebUIToolbarWebView;
@@ -395,6 +396,7 @@ class ToolbarView : public views::AccessiblePaneView,
   // An alias for `pinned_toolbar_actions_container_` or
   // `toolbar_webview_->GetPinnedActionsContainer()`.
   raw_ptr<PinnedToolbarActions> pinned_toolbar_actions_ = nullptr;
+  raw_ptr<FloatingWindowToolbarButton> floating_window_button_ = nullptr;
   raw_ptr<AvatarToolbarButton> avatar_ = nullptr;
   raw_ptr<MediaToolbarButton> media_button_ = nullptr;
   raw_ptr<BrowserAppMenuButton> app_menu_button_ = nullptr;

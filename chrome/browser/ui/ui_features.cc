@@ -520,6 +520,8 @@ BASE_FEATURE(kOSCryptAsyncAvailabilityInfoBar,
 #endif
 );
 
+BASE_FEATURE(kFloatingWindowToolbarButton, base::FEATURE_ENABLED_BY_DEFAULT);
+
 // Defer layout passes on BrowserView while the main browser window is still
 // invisible during early startup. Asynchronous startup components (like the
 // WebUI Toolbar) trigger multiple redundant layouts via Mojo updates while
