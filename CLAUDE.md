@@ -247,6 +247,32 @@ go out. Chromium uses Gerrit via `git cl`, not GitHub PRs.
 - Commit messages: imperative mood, no "This CL", refer to functions as
   `FunctionName()`, wrap at 72 chars.
 
+## Publishing
+
+Work here goes to a personal GitHub fork, never to Gerrit:
+
+```
+github   https://github.com/obeletski/chromium.git      feature branches live here
+origin   https://chromium.googlesource.com/chromium/src.git   upstream, fetch only
+```
+
+- `git push github <branch>`. A branch that has been rebased or squashed needs
+  `git push --force-with-lease=<branch>:<sha you expect to replace> github <branch>`.
+  Pin the expected sha rather than using bare `--force`, which will silently
+  discard anything pushed from elsewhere.
+- **The docs link into this fork.** Source references in `docs/floating_window/`
+  and `docs/digitclassifier/` are
+  `https://github.com/obeletski/chromium/blob/<branch>/<path>`, with `#L`
+  anchors where a line is cited. They 404 until the branch is pushed, and the
+  anchors drift when it is rebased.
+- Do **not** link paths under `third_party/dawn/`: dawn is a submodule
+  (mode 160000), so GitHub shows a pointer there, not files. Same for anything
+  untracked and for ambiguous basenames — `gpu.cc` matches two tracked files.
+  Validate a path with `git ls-files --error-unmatch`, not with `test -e`:
+  `digit_classifier.tflite` and `out/*/args.gn` exist on disk but are untracked.
+- **The fork is public.** Scrub machine paths — `/home/<user>`, `~/chromium/src`
+  — from anything added to `docs/`.
+
 ## Architecture: the layering that matters
 
 Dependencies flow one way. Putting code in the wrong layer is the most common
