@@ -52,24 +52,27 @@ graph TB
   subgraph BROWSER["Browser process — all of this is C++"]
     direction TB
     BTN["FloatingWindowToolbarButton"]
-    DEL["views::BubbleDialogDelegate"]
+    CAS["floating_window::CreateAndShow"]
     WV["views::WebView, owns a WebContents"]
+    NAV["NavigationRequest +<br/>NavigationURLLoaderImpl"]
+    LF["WebUIURLLoaderFactory<br/>type = kNavigation"]
     UI["FloatingWindowUI"]
     SRC["WebUIDataSource + request filter<br/>returns the C++ string literal"]
-    LF["WebUIURLLoaderFactory"]
-    BTN -->|"CreateAndShow"| DEL
-    DEL -->|"SetContentsView"| WV
-    WV -->|"LoadInitialURL, host resolved<br/>through WebUIConfigMap"| UI
+    BTN -->|"press"| CAS
+    CAS -->|"builds the bubble around it,<br/>then LoadInitialURL"| WV
+    WV -->|"NavigationController::<br/>LoadURLWithParams"| NAV
+    NAV -->|"host resolved through<br/>WebUIConfigMap"| UI
     UI -->|"CreateAndAdd + SetRequestFilter"| SRC
+    NAV -->|"① creates, browser-side"| LF
     LF -->|"② StartDataRequest"| SRC
+    SRC -->|"③ HandleRequest returns the bytes"| LF
   end
 
   subgraph RENDERER["Renderer process — its own, not a tab's"]
     DOC["Blink document, chrome://floating-window"]
   end
 
-  DOC ==>|"① resource request"| LF
-  SRC ==>|"③ HTML bytes"| DOC
+  LF ==>|"④ response body, streamed on commit"| DOC
 
   classDef browser fill:#d6e4fa,stroke:#3a63a8,stroke-width:1.5px,color:#12305e
   classDef renderer fill:#fadfc0,stroke:#a86b22,stroke-width:1.5px,color:#5c3407
@@ -77,11 +80,109 @@ graph TB
   class RENDERER renderer
 ```
 
-Steps ① ② ③ are the only traffic that crosses the process boundary. Everything
-else — the button, the widget, the controller, the bytes themselves — is
-browser-side C++.
+**The renderer never asks for anything.** Steps ① ② ③ all happen inside the
+browser: a `chrome://` navigation is fetched by `NavigationURLLoaderImpl`, which
+builds a `WebUIURLLoaderFactory` of type `kNavigation` and runs it with
+`kBrowserProcessId` ([`navigation_url_loader_impl.cc:712`](https://github.com/obeletski/chromium/blob/floating-window/content/browser/loader/navigation_url_loader_impl.cc#L712)).
+Only step ④ crosses the process boundary, and it goes browser → renderer: the
+finished document is streamed in as the navigation's response body.
+
+There is a second, renderer-driven path — `CreateWebUIURLLoaderFactory` is also
+called from `RenderFrameHostImpl` with type `kDocumentSubResource` — but it is
+for subresources a page asks for after it loads. This page has none: no script,
+no external stylesheet, no images.
 
 ---
+
+### The classes, and their renderer-side counterparts
+
+The map above is the flow; this is the type structure behind it. Solid arrows
+are ownership, hollow triangles inheritance, dotted lines the Mojo pairs that
+straddle the process boundary.
+
+```mermaid
+classDiagram
+  direction TB
+
+  namespace ViewsUI {
+    class LabelButton
+    class ToolbarButton
+    class FloatingWindowToolbarButton
+    class WidgetDelegate
+    class DialogDelegate
+    class BubbleDialogDelegate
+    class Widget
+    class View
+    class WebView
+  }
+
+  namespace BrowserContent {
+    class WebContents
+    class WebContentsImpl
+    class WebContentsDelegate
+    class RenderProcessHostImpl
+    class RenderFrameHostImpl
+    class RenderWidgetHostImpl
+    class WebUIImpl
+    class WebUIController
+    class FloatingWindowUI
+    class WebUIDataSourceImpl
+  }
+
+  namespace RendererProcess {
+    class RenderThreadImpl
+    class RenderFrameImpl
+    class WebFrameWidgetImpl
+    class LocalFrame
+    class LocalFrameView
+    class Document
+  }
+
+  LabelButton <|-- ToolbarButton
+  ToolbarButton <|-- FloatingWindowToolbarButton
+  WidgetDelegate <|-- DialogDelegate
+  DialogDelegate <|-- BubbleDialogDelegate
+  View <|-- WebView
+  WebContentsDelegate <|.. WebView : implements
+  WebContents <|.. WebContentsImpl
+  WebUIController <|-- FloatingWindowUI
+
+  FloatingWindowToolbarButton ..> Widget : observes, widget_
+  Widget --* BubbleDialogDelegate : owns the delegate
+  BubbleDialogDelegate --* WebView : contents view
+  WebView --* WebContents : wc_owner_
+  WebContentsImpl --* RenderFrameHostImpl
+  RenderFrameHostImpl --* WebUIImpl : web_ui_
+  WebUIImpl --* WebUIController : controller_
+  FloatingWindowUI ..> WebUIDataSourceImpl : CreateAndAdd
+  RenderFrameHostImpl --> RenderWidgetHostImpl
+  RenderFrameHostImpl --> RenderProcessHostImpl
+
+  RenderProcessHostImpl <..> RenderThreadImpl : the process itself
+  RenderFrameHostImpl <..> RenderFrameImpl : mojom Frame
+  RenderWidgetHostImpl <..> WebFrameWidgetImpl : mojom FrameWidget
+  RenderFrameImpl --> LocalFrame : via WebLocalFrameImpl
+  LocalFrame --* LocalFrameView
+  LocalFrame --* Document
+```
+
+Three things this makes visible that prose keeps burying.
+
+**`views::WebView` wears two hats.** It is a `View` so it can sit in the bubble,
+and it implements `content::WebContentsDelegate` so the `WebContents` it owns
+can call back into it. That is the whole reason `ResizeDueToAutoResize` lands on
+the WebView in §6 — the WebView made itself the delegate in `SetDelegate(this)`.
+
+**The `WebUIController` hangs off the frame, not the tab.** `FloatingWindowUI`
+is owned by `WebUIImpl`, which is owned by `RenderFrameHostImpl` — so it is
+per-frame and per-navigation, not a long-lived per-profile object. A
+cross-document navigation destroys and rebuilds it.
+
+**Nothing in this feature has a renderer-side counterpart.** The dotted pairs
+are all generic content/ plumbing that any page gets. The three classes written
+for this feature — the button, the bubble helper, `FloatingWindowUI` — are
+browser-only. On the other side of the boundary there is just a `Document` with
+one `<p>` in it.
 
 ## 3. The button, and why it lands where it does
 
@@ -144,39 +245,58 @@ asked for.
 
 ### What one press actually does
 
-Ordering matters here because the widget is shown *before* the page exists — the
-bubble appears at its minimum size and grows when the renderer reports back
-(§6). Nothing waits on the renderer.
+Two things are easy to get wrong here. **`LoadInitialURL` is called by
+`CreateAndShow`, not by the WebView on itself** — the WebView is a passive host.
+And **constructing `views::WebView(profile)` does not create a `WebContents`**;
+it only records the `BrowserContext`. The `WebContents` is created lazily, on
+the first `GetWebContents()` call, which `LoadInitialURL` triggers
+([`webview.cc:106`](https://github.com/obeletski/chromium/blob/floating-window/ui/views/controls/webview/webview.cc#L106)).
+That same call is where `SetDelegate(this)` runs, which is what later lets the
+renderer's resize reach the WebView at all (§6).
+
+Ordering matters too: the widget is shown *before* the document is committed.
+The bubble appears at its minimum size and grows once the renderer reports back.
+Nothing waits on the renderer.
 
 ```mermaid
 sequenceDiagram
   autonumber
   actor U as User
-  participant BTN as FloatingWindowToolbarButton<br/>browser
-  participant DEL as BubbleDialogDelegate<br/>browser
-  participant WV as views::WebView<br/>browser
-  participant UI as FloatingWindowUI<br/>browser
+  participant BTN as FloatingWindow<br/>ToolbarButton
+  participant CAS as floating_window::<br/>CreateAndShow
+  participant WV as views::WebView
+  participant WC as WebContents +<br/>NavigationController
+  participant NAV as NavigationURLLoaderImpl<br/>+ WebUIURLLoaderFactory
+  participant UI as FloatingWindowUI<br/>+ WebUIDataSource
   participant R as Renderer process
 
   U->>BTN: click
-  BTN->>BTN: widget_ is null, so open
-  BTN->>DEL: CreateAndShow(anchor=this, profile)
-  DEL->>WV: new WebView(profile)
-  DEL->>WV: set_allow_accelerators(true)
-  WV->>WV: LoadInitialURL(chrome://floating-window/)
-  Note over WV,UI: navigation resolves the host in WebUIConfigMap
-  WV->>UI: construct controller
-  UI->>UI: CreateAndAdd(data source) + SetRequestFilter
-  DEL->>DEL: CreateBubbleDeprecated + Show
-  BTN->>BTN: observe widget, store widget_
-  Note over BTN: press handling is done here — the page is still loading
+  BTN->>BTN: widget_ == nullptr, so open
+  BTN->>CAS: CreateAndShow(anchor = this, profile)
+  CAS->>WV: new views::WebView(profile)
+  Note over WV: only stores the BrowserContext —<br/>no WebContents exists yet
+  CAS->>WV: set_allow_accelerators(true)
+  CAS->>WV: LoadInitialURL(chrome://floating-window/)
+  WV->>WV: GetWebContents() — first call, so create it now
+  WV->>WC: WebContents::Create(browser_context)
+  WV->>WC: SetDelegate(this)
+  Note over WV,WC: this is where the WebView becomes the<br/>WebContentsDelegate that later receives the resize
+  WV->>WC: GetController().LoadURLWithParams(...)
 
-  R->>UI: request chrome://floating-window/
-  UI-->>R: HTML bytes from the string literal
+  WC->>NAV: navigation begins
+  NAV->>UI: host resolved in WebUIConfigMap,<br/>CreateWebUIController
+  UI->>UI: CreateAndAdd(data source) + SetRequestFilter
+  NAV->>UI: StartDataRequest (kNavigation, browser-side)
+  UI-->>NAV: HandleRequest returns the C++ string
+
+  CAS->>CAS: SetContentsView, CreateBubbleDeprecated, Show
+  CAS-->>BTN: Widget*
+  BTN->>BTN: observe it, store widget_
+  Note over BTN: press handling ends here — the document<br/>has not been committed yet
+
+  NAV->>R: commit + response body
   R->>R: parse, style, lay out
-  R-->>WV: ResizeDueToAutoResize(size)
-  WV->>DEL: preferred size changed
-  DEL->>DEL: autosize, widget grows to fit
+  Note over R,WV: the window is still at its minimum size —<br/>§6 covers how the renderer's size gets back
 ```
 
 ### Why the button observes the widget
