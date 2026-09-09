@@ -3,6 +3,11 @@
 Design alternatives and the chosen implementation, written against this
 checkout (`~/chromium-desk/src`) at `f6fd8f0cdc96a`, branch `floating-window`.
 
+> **Source links.** Every path below links into
+> [github.com/obeletski/chromium](https://github.com/obeletski/chromium) on the
+> `floating-window` branch. Line anchors were checked against the tree these docs
+> were written from; they will drift if the branch is rebased onto newer upstream.
+
 ## The requirement
 
 1. An icon in the desktop (Linux) Chromium toolbar, sitting next to the profile
@@ -14,6 +19,7 @@ checkout (`~/chromium-desk/src`) at `f6fd8f0cdc96a`, branch `floating-window`.
 Three decisions fall out of that, and they are independent: **where the button
 comes from**, **what kind of widget the window is**, and **how the HTML gets to
 the renderer**. Each is treated separately below.
+
 
 ---
 
@@ -48,7 +54,7 @@ index puts the icon exactly where you want it, permanently.
 The modern route. You declare an `ActionId` (`chrome/browser/ui/actions/`),
 register an `ActionItem` with an icon, text and an invoke callback, and pin it
 by default through `PinnedToolbarActionsModel`. `PinnedToolbarActionsContainer`
-(`toolbar_view.cc:499`) then materialises a `PinnedActionToolbarButton` for it.
+([`toolbar_view.cc:500`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/toolbar_view.cc#L500)) then materialises a `PinnedActionToolbarButton` for it.
 This is how the side panel entries and `kActionShowAiOverlayDialog` work.
 
 * **For:** the idiomatic 2025/2026 pattern. Free context menu, pinning,
@@ -85,6 +91,44 @@ could be added on that side in TypeScript instead.
 
 ## Part B — what kind of widget the window is
 
+The four serious candidates differ in how much of the stack they drag in. Each
+column is one option; the boxes are what you end up owning.
+
+```mermaid
+graph TB
+  subgraph B4["B4 — WebUIBubbleManager"]
+    direction TB
+    b4a["WebUIBubbleManager"] --> b4b["WebUIContentsWrapper"]
+    b4b --> b4c["TopChromeWebUIController<br/><small>+ Mojo Embedder</small>"]
+    b4c --> b4d["build_webui target<br/><small>.grd + TypeScript</small>"]
+  end
+  subgraph B3["B3 — popup Browser"]
+    direction TB
+    b3a["Browser TYPE_POPUP"] --> b3b["TabStripModel"]
+    b3b --> b3c["BrowserWindow + frame"]
+    b3c --> b3d["WebContents"]
+  end
+  subgraph B2["B2 — bare top-level Widget"]
+    direction TB
+    b2a["views::Widget<br/><small>+ WidgetDelegateView</small>"] --> b2b["hand-rolled Esc,<br/>focus, shadow, theming"]
+    b2b --> b2c["views::WebView"]
+    b2c --> b2d["WebContents"]
+  end
+  subgraph B1["B1 — bubble (chosen)"]
+    direction TB
+    b1a["views::BubbleDialogDelegate"] --> b1b["views::WebView"]
+    b1b --> b1c["WebContents"]
+  end
+
+  classDef pick fill:#bfe3d0,stroke:#1e6b45,stroke-width:1.5px,color:#0d3b26
+  class B1 pick
+```
+
+B1 wins not because it is the most capable but because a bubble **already is**
+an independent top-level widget with a shadow and a themed frame. B2 reaches the
+same place by re-implementing what B1 inherits; B3 and B4 add whole subsystems.
+
+
 ### B1. `views::BubbleDialogDelegateView` anchored to the button
 
 A bubble is already a separate, non-modal, top-level `views::Widget` with a
@@ -92,7 +136,7 @@ shadow and a rounded frame — "floating" in every sense that matters — that
 happens to position itself relative to an anchor view.
 
 * **For:** Esc-to-close comes for free (`DialogClientView` registers the
-  `VKEY_ESCAPE` accelerator at `ui/views/window/dialog_client_view.cc:114`).
+  `VKEY_ESCAPE` accelerator at [`ui/views/window/dialog_client_view.cc:114`](https://github.com/obeletski/chromium/blob/floating-window/ui/views/window/dialog_client_view.cc#L114)).
   `set_close_on_deactivate(false)` makes it persist while you use the browser,
   which is what "floating window" implies. `autosize` sizes it to its contents.
   It follows the browser window when that moves.
@@ -140,6 +184,41 @@ Rejected outright: docked, not floating.
 
 ## Part C — how the HTML reaches the renderer
 
+All four options end with bytes arriving in the renderer over the same Mojo
+`URLLoader`. They differ in where those bytes come *from*, and how much build
+machinery stands between the source text and the response.
+
+```mermaid
+graph LR
+  subgraph SRCS["Where the bytes originate — browser process"]
+    C1["C1: data: URL<br/><small>string in the GURL itself</small>"]
+    C2["C2: C++ string literal<br/><small>+ SetRequestFilter</small>"]
+    C3["C3: SetResourcePathToResponse<br/><small>path_to_response_map_</small>"]
+    C4["C4: .pak resource<br/><small>build_webui + .grd + IDR</small>"]
+  end
+
+  C1 --> N1["top-level data: navigation<br/>opaque origin, restricted"]
+  C2 --> SD["WebUIDataSourceImpl::<br/>StartDataRequest"]
+  C4 --> SD
+  C3 -.->|"never consulted here"| SD
+  C3 --> LRL["PopulateWebUIResources<br/>LocalResourceLoaderConfig"]
+
+  SD --> LF["WebUIURLLoaderFactory"]
+  LF ==>|"Mojo"| DOC["Blink document<br/><small>renderer process</small>"]
+  N1 -.->|"blocked / fragile"| DOC
+  LRL -.->|"only on that path"| DOC
+
+  classDef pick fill:#bfe3d0,stroke:#1e6b45,stroke-width:1.5px,color:#0d3b26
+  classDef bad fill:#f3c2c7,stroke:#96222e,stroke-width:1.5px,color:#4d1219
+  class C2 pick
+  class C1,C3 bad
+```
+
+The dashed edges are the trap: `StartDataRequest()` — the function that actually
+answers a `chrome://` request — checks the request filter first and the resource
+ID second, and **never reads** the map that `SetResourcePathToResponse()` fills.
+
+
 ### C1. A `data:` URL in a bare `views::WebView`
 
 `web_view->LoadInitialURL(GURL("data:text/html,..."))`.
@@ -158,15 +237,15 @@ controller call `content::WebUIDataSource::CreateAndAdd()` and
 
 * **For:** a real, correctly-originated WebUI page with a proper CSP, and
   **no `.grd` entry, no resource ID, no TypeScript target, no Mojo**. The whole
-  page is one C++ string literal. `chrome/browser/ui/webui/internals/internals_ui.cc:58`
+  page is one C++ string literal. [`chrome/browser/ui/webui/internals/internals_ui.cc:58`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/internals/internals_ui.cc#L58)
   does exactly this.
 * **Against:** still needs a host constant and one line in
-  `chrome_web_ui_configs.cc`.
+  [`chrome_web_ui_configs.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/chrome_web_ui_configs.cc).
 
 ### C3. `SetResourcePathToResponse()`
 
 Looks like a shorter C2 — and it is used that way in content browsertests
-(`content/browser/webui/initial_webui_browsertest.cc:144`). But it only
+([`content/browser/webui/initial_webui_browsertest.cc:144`](https://github.com/obeletski/chromium/blob/floating-window/content/browser/webui/initial_webui_browsertest.cc#L144)). But it only
 populates `path_to_response_map_`, which is consumed by
 `PopulateWebUIResources()` for the `LocalResourceLoaderConfig` path;
 `WebUIDataSourceImpl::StartDataRequest()` never consults it. Correctness would
@@ -195,29 +274,29 @@ that is both architecturally honest and small enough to be proportionate.
 
 | File | Role |
 |---|---|
-| `chrome/common/webui_url_constants.h` | `kChromeUIFloatingWindowHost` / `…URL` |
-| `chrome/browser/ui/webui/floating_window/floating_window_ui.{h,cc}` | `FloatingWindowUIConfig`, `FloatingWindowUI`; serves the HTML from a string |
+| [`chrome/common/webui_url_constants.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/common/webui_url_constants.h) | `kChromeUIFloatingWindowHost` / `…URL` |
+| `chrome/browser/ui/webui/floating_window/`<br/>[`floating_window_ui.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_ui.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_ui.cc) | `FloatingWindowUIConfig`, `FloatingWindowUI`; serves the HTML from a string |
 | `chrome/browser/ui/webui/floating_window/BUILD.gn` | its `source_set` |
-| `chrome/browser/ui/webui/chrome_web_ui_configs.cc` | registers the config |
-| `chrome/browser/ui/views/floating_window/floating_window_bubble.{h,cc}` | `floating_window::CreateAndShow()`; the bubble hosting a `views::WebView` |
+| [`chrome/browser/ui/webui/chrome_web_ui_configs.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/chrome_web_ui_configs.cc) | registers the config |
+| `chrome/browser/ui/views/floating_window/`<br/>[`floating_window_bubble.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/floating_window/floating_window_bubble.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/floating_window/floating_window_bubble.cc) | `floating_window::CreateAndShow()`; the bubble hosting a `views::WebView` |
 | `chrome/browser/ui/views/floating_window/BUILD.gn` | its `source_set` |
-| `chrome/browser/ui/views/toolbar/floating_window_toolbar_button.{h,cc}` | the `ToolbarButton`, owns the bubble widget, toggles it |
-| `chrome/browser/ui/views/toolbar/toolbar_view.{h,cc}` | creates the button before `avatar_` |
-| `chrome/browser/ui/ui_features.{h,cc}` | `kFloatingWindowToolbarButton` kill switch |
+| `chrome/browser/ui/views/toolbar/`<br/>[`floating_window_toolbar_button.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/floating_window_toolbar_button.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/floating_window_toolbar_button.cc) | the `ToolbarButton`, owns the bubble widget, toggles it |
+| `chrome/browser/ui/views/toolbar/`<br/>[`toolbar_view.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/toolbar_view.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/toolbar_view.cc) | creates the button before `avatar_` |
+| `chrome/browser/ui/`<br/>[`ui_features.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/ui_features.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/ui_features.cc) | `kFloatingWindowToolbarButton` kill switch |
 
 ### The two mechanisms worth calling out
 
 **Esc.** `views::WebView` swallows accelerators by default so that pages can use
 Esc; a UI-hosting WebView must opt out with `set_allow_accelerators(true)`
-(`ui/views/controls/webview/webview.h:209`). With that set, Esc reaches the
+([`ui/views/controls/webview/webview.h:209`](https://github.com/obeletski/chromium/blob/floating-window/ui/views/controls/webview/webview.h#L209)). With that set, Esc reaches the
 bubble's `FocusManager`, hits the `DialogClientView` accelerator, and closes the
 widget.
 
 **Subclassing.** `views::BubbleDialogDelegateView` cannot be subclassed by new
 code: its constructors are private behind a `friend` allowlist
-(`bubble_dialog_delegate_view.h:890`). New bubbles instead construct a
+([`bubble_dialog_delegate_view.h:890`](https://github.com/obeletski/chromium/blob/floating-window/ui/views/bubble/bubble_dialog_delegate_view.h#L890)). New bubbles instead construct a
 `views::BubbleDialogDelegate` and hand it a contents view via
-`SetContentsView()`, which is what `ai_overlay_toolbar_button.cc` does. Here the
+`SetContentsView()`, which is what [`ai_overlay_toolbar_button.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/ai_overlay_toolbar_button.cc) does. Here the
 contents view is the `views::WebView` itself.
 
 **Toggle-on-second-click.** Bubbles normally close on deactivation, which fires
@@ -230,7 +309,7 @@ This is also what makes the surface behave like a window rather than a menu.
 
 * No localized strings. The tooltip and accessible name are hardcoded
   `u"..."` literals with a TODO, following the precedent in
-  `ai_overlay_toolbar_button.cc`. Adding `IDS_` messages to
+  [`ai_overlay_toolbar_button.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/ai_overlay_toolbar_button.cc). Adding `IDS_` messages to
   `generated_resources.grd` requires translation screenshots that presubmit
   enforces, which is not proportionate to a demo surface.
 * No new vector icon. It reuses `kNewWindowIcon` from

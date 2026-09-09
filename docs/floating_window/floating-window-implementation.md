@@ -6,6 +6,12 @@ Written against branch `floating-window` (based on `f6fd8f0cdc96a`) in
 [`floating-window-alternatives.md`](floating-window-alternatives.md); this
 document only covers what was built.
 
+> **Source links.** Every path below links into
+> [github.com/obeletski/chromium](https://github.com/obeletski/chromium) on the
+> `floating-window` branch. Line anchors were checked against the tree these docs
+> were written from; they will drift if the branch is rebased onto newer upstream.
+
+
 ---
 
 ## 1. What it does
@@ -25,33 +31,61 @@ enabled by default.
 
 | File | Job |
 |---|---|
-| `chrome/common/webui_url_constants.h` | `kChromeUIFloatingWindowHost` = `"floating-window"`, and the `chrome://floating-window/` URL |
-| `chrome/browser/ui/webui/floating_window/floating_window_ui.{h,cc}` | `FloatingWindowUIConfig` (registry entry) and `FloatingWindowUI` (serves the HTML) |
-| `chrome/browser/ui/webui/chrome_web_ui_configs.cc` | registers the config at startup |
-| `chrome/browser/ui/views/floating_window/floating_window_bubble.{h,cc}` | `floating_window::CreateAndShow()` — builds the bubble around a `views::WebView` |
-| `chrome/browser/ui/views/toolbar/floating_window_toolbar_button.{h,cc}` | the `ToolbarButton`; owns the toggle state |
-| `chrome/browser/ui/views/toolbar/toolbar_view.{h,cc}` | creates the button at the right position |
-| `chrome/browser/ui/ui_features.{h,cc}` | the feature flag |
-| `tools/metrics/histograms/metadata/{ui/enums.xml,page/histograms.xml}` | required metrics registration for a new WebUI host (§7) |
+| [`chrome/common/webui_url_constants.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/common/webui_url_constants.h) | `kChromeUIFloatingWindowHost` = `"floating-window"`, and the `chrome://floating-window/` URL |
+| `chrome/browser/ui/webui/floating_window/`<br/>[`floating_window_ui.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_ui.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_ui.cc) | `FloatingWindowUIConfig` (registry entry) and `FloatingWindowUI` (serves the HTML) |
+| [`chrome/browser/ui/webui/chrome_web_ui_configs.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/chrome_web_ui_configs.cc) | registers the config at startup |
+| `chrome/browser/ui/views/floating_window/`<br/>[`floating_window_bubble.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/floating_window/floating_window_bubble.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/floating_window/floating_window_bubble.cc) | `floating_window::CreateAndShow()` — builds the bubble around a `views::WebView` |
+| `chrome/browser/ui/views/toolbar/`<br/>[`floating_window_toolbar_button.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/floating_window_toolbar_button.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/floating_window_toolbar_button.cc) | the `ToolbarButton`; owns the toggle state |
+| `chrome/browser/ui/views/toolbar/`<br/>[`toolbar_view.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/toolbar_view.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/toolbar_view.cc) | creates the button at the right position |
+| `chrome/browser/ui/`<br/>[`ui_features.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/ui_features.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/ui_features.cc) | the feature flag |
+| [`ui/enums.xml`](https://github.com/obeletski/chromium/blob/floating-window/tools/metrics/histograms/metadata/ui/enums.xml) · [`page/histograms.xml`](https://github.com/obeletski/chromium/blob/floating-window/tools/metrics/histograms/metadata/page/histograms.xml) | required metrics registration for a new WebUI host (§7) |
 
-Three layers, and the interesting thing is how little glue they need:
+Three layers, and the interesting thing is how little glue they need.
 
+The single most useful thing to hold in your head: **everything here lives in
+the browser process except the rendered document.** The HTML is a C++ string
+literal compiled into the browser binary; it only becomes a document after
+crossing into a renderer as bytes over a Mojo `URLLoader`.
+
+```mermaid
+graph TB
+  subgraph BROWSER["Browser process — all of this is C++"]
+    direction TB
+    BTN["FloatingWindowToolbarButton"]
+    DEL["views::BubbleDialogDelegate"]
+    WV["views::WebView, owns a WebContents"]
+    UI["FloatingWindowUI"]
+    SRC["WebUIDataSource + request filter<br/>returns the C++ string literal"]
+    LF["WebUIURLLoaderFactory"]
+    BTN -->|"CreateAndShow"| DEL
+    DEL -->|"SetContentsView"| WV
+    WV -->|"LoadInitialURL, host resolved<br/>through WebUIConfigMap"| UI
+    UI -->|"CreateAndAdd + SetRequestFilter"| SRC
+    LF -->|"② StartDataRequest"| SRC
+  end
+
+  subgraph RENDERER["Renderer process — its own, not a tab's"]
+    DOC["Blink document, chrome://floating-window"]
+  end
+
+  DOC ==>|"① resource request"| LF
+  SRC ==>|"③ HTML bytes"| DOC
+
+  classDef browser fill:#d6e4fa,stroke:#3a63a8,stroke-width:1.5px,color:#12305e
+  classDef renderer fill:#fadfc0,stroke:#a86b22,stroke-width:1.5px,color:#5c3407
+  class BROWSER browser
+  class RENDERER renderer
 ```
-ToolbarView                                  (chrome/browser/ui/views/toolbar)
-  └── FloatingWindowToolbarButton            owns nothing; tracks one bool-ish pointer
-        └── floating_window::CreateAndShow() (chrome/browser/ui/views/floating_window)
-              └── views::BubbleDialogDelegate
-                    └── views::WebView  ──navigates to──▶ chrome://floating-window/
-                                                            │
-                          FloatingWindowUI ◀────────────────┘  (chrome/browser/ui/webui)
-                            └── WebUIDataSource + request filter ──▶ HTML string
-```
+
+Steps ① ② ③ are the only traffic that crosses the process boundary. Everything
+else — the button, the widget, the controller, the bytes themselves — is
+browser-side C++.
 
 ---
 
 ## 3. The button, and why it lands where it does
 
-`ToolbarView::Init()` (`toolbar_view.cc:308`) builds the toolbar's children in a
+`ToolbarView::Init()` ([`toolbar_view.cc:309`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/toolbar_view.cc#L309)) builds the toolbar's children in a
 fixed sequence, and the layout manager lays them out **in child order**. So
 position is decided by nothing more than where `AddChildView()` is called:
 
@@ -108,6 +142,43 @@ reopen. Turning deactivation-closing off removes the race at the source instead,
 and independently gives the "floating window, not a menu" behaviour that was
 asked for.
 
+### What one press actually does
+
+Ordering matters here because the widget is shown *before* the page exists — the
+bubble appears at its minimum size and grows when the renderer reports back
+(§6). Nothing waits on the renderer.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor U as User
+  participant BTN as FloatingWindowToolbarButton<br/>browser
+  participant DEL as BubbleDialogDelegate<br/>browser
+  participant WV as views::WebView<br/>browser
+  participant UI as FloatingWindowUI<br/>browser
+  participant R as Renderer process
+
+  U->>BTN: click
+  BTN->>BTN: widget_ is null, so open
+  BTN->>DEL: CreateAndShow(anchor=this, profile)
+  DEL->>WV: new WebView(profile)
+  DEL->>WV: set_allow_accelerators(true)
+  WV->>WV: LoadInitialURL(chrome://floating-window/)
+  Note over WV,UI: navigation resolves the host in WebUIConfigMap
+  WV->>UI: construct controller
+  UI->>UI: CreateAndAdd(data source) + SetRequestFilter
+  DEL->>DEL: CreateBubbleDeprecated + Show
+  BTN->>BTN: observe widget, store widget_
+  Note over BTN: press handling is done here — the page is still loading
+
+  R->>UI: request chrome://floating-window/
+  UI-->>R: HTML bytes from the string literal
+  R->>R: parse, style, lay out
+  R-->>WV: ResizeDueToAutoResize(size)
+  WV->>DEL: preferred size changed
+  DEL->>DEL: autosize, widget grows to fit
+```
+
 ### Why the button observes the widget
 
 The bubble can also close *itself* (Esc). If `widget_` were only cleared by
@@ -148,8 +219,8 @@ setters, and the contents arrive via `SetContentsView()`.
 
 Note the *View* flavour, `views::BubbleDialogDelegateView`, cannot be subclassed
 by new code — its constructors are private behind a `friend` allowlist
-(`ui/views/bubble/bubble_dialog_delegate_view.h:890`). New bubbles use the
-delegate + `SetContentsView()` shape, as `ai_overlay_toolbar_button.cc` does.
+([`ui/views/bubble/bubble_dialog_delegate_view.h:968`](https://github.com/obeletski/chromium/blob/floating-window/ui/views/bubble/bubble_dialog_delegate_view.h#L968)). New bubbles use the
+delegate + `SetContentsView()` shape, as [`ai_overlay_toolbar_button.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/ai_overlay_toolbar_button.cc) does.
 
 Construction, in order:
 
@@ -185,10 +256,37 @@ which may bind Esc itself.
 
 For a WebView hosting browser UI it is backwards. `set_allow_accelerators(true)`
 flips the check so only tab-traversal keys are skipped
-(`ui/views/controls/webview/webview.cc:336`). Esc then reaches the
+([`ui/views/controls/webview/webview.cc:336`](https://github.com/obeletski/chromium/blob/floating-window/ui/views/controls/webview/webview.cc#L336)). Esc then reaches the
 `FocusManager`, matches the `VKEY_ESCAPE` accelerator that `DialogClientView`
-registers (`ui/views/window/dialog_client_view.cc:114`), and the widget closes —
+registers ([`ui/views/window/dialog_client_view.cc:114`](https://github.com/obeletski/chromium/blob/floating-window/ui/views/window/dialog_client_view.cc#L114)), and the widget closes —
 which fires `OnWidgetDestroying()` on the button, clearing its pointer.
+
+The flag decides *which process* handles the key. With it set, Esc never leaves
+the browser:
+
+```mermaid
+graph TB
+  K["Esc pressed<br/><small>focus is inside the WebView</small>"] --> W["views::Widget::OnKeyEvent<br/><small>browser process</small>"]
+  W --> Q{"SkipDefault<br/>KeyEvent<br/>Processing?"}
+
+  Q -->|"default: true whenever<br/>the WebContents is alive"| F1["forward the key to the renderer first"]
+  F1 --> F2["Blink: no handler for Esc"]
+  F2 --> F3["returned to the browser as unhandled<br/><small>WebContentsDelegate::HandleKeyboardEvent</small>"]
+  F3 --> F4["only closes if a delegate<br/>forwards it back to the FocusManager"]
+
+  Q -->|"allow_accelerators = true:<br/>only tab-traversal keys skip"| A1["accelerator lookup, browser-side"]
+  A1 --> A2["DialogClientView VKEY_ESCAPE<br/><small>dialog_client_view.cc:114</small>"]
+  A2 --> A3["Widget closes"]
+  A3 --> A4["OnWidgetDestroying clears the button's widget_"]
+
+  classDef bad fill:#f3c2c7,stroke:#96222e,stroke-width:1.5px,color:#4d1219
+  classDef good fill:#bfe3d0,stroke:#1e6b45,stroke-width:1.5px,color:#0d3b26
+  class F1,F2,F3,F4 bad
+  class A1,A2,A3,A4 good
+```
+
+The red path is not merely slower — nothing in this feature implements the
+`HandleKeyboardEvent` hand-back, so on that path Esc would simply do nothing.
 
 ### Ownership
 
@@ -209,20 +307,23 @@ simpler contract for a surface that can close itself.
 The bubble is created before the page has rendered, so its size cannot be known
 up front. The chain that resolves it:
 
-```
-EnableSizingFromWebContents(kMinSize, kMaxSize)
-      │  stores bounds, turns on renderer auto-resize
-      ▼
-RenderWidgetHostView::EnableAutoResize(min, max)
-      │  renderer lays out, reports its content size
-      ▼
-WebView::ResizeDueToAutoResize()          // WebView is its own WebContentsDelegate
-      │
-      ▼
-View::SetPreferredSize()  →  layout invalidated
-      │
-      ▼
-bubble autosize=true  →  Widget resizes to fit
+```mermaid
+sequenceDiagram
+  autonumber
+  participant WV as views::WebView<br/>browser
+  participant RWHV as RenderWidgetHostView<br/>browser
+  participant R as Renderer process
+  participant BUB as Bubble Widget<br/>browser
+
+  WV->>WV: EnableSizingFromWebContents(min, max)<br/>stores the bounds
+  WV->>RWHV: MaybeEnableAutoResize
+  RWHV->>R: EnableAutoResize(min, max)
+  Note over R: parse, style, lay out the document
+  R-->>WV: ResizeDueToAutoResize(content size)
+  Note right of WV: WebView is its own WebContentsDelegate,<br/>so the callback lands on itself
+  WV->>WV: SetPreferredSize, invalidating layout
+  WV->>BUB: preferred size changed
+  BUB->>BUB: autosize=true, resize the Widget to fit
 ```
 
 Two consequences worth knowing:
@@ -231,7 +332,7 @@ Two consequences worth knowing:
   would never pick up the new preferred size.
 - **Calling `EnableSizingFromWebContents()` before the renderer exists is fine.**
   `WebView` re-applies the stored bounds from `SetUpNewMainFrame()` whenever a
-  new main frame appears (`webview.cc:784`).
+  new main frame appears ([`webview.cc:784`](https://github.com/obeletski/chromium/blob/floating-window/ui/views/controls/webview/webview.cc#L784)).
 
 The widget is shown immediately, at its minimum size, and grows when the
 renderer reports back.
@@ -280,7 +381,7 @@ ahead of the resource-ID lookup. It takes two callbacks:
 
 > **A trap.** `SetResourcePathToResponse()` looks like a shorter way to do this
 > and is used exactly that way in content's own browsertests
-> (`content/browser/webui/initial_webui_browsertest.cc:144`). But it only fills
+> ([`content/browser/webui/initial_webui_browsertest.cc:144`](https://github.com/obeletski/chromium/blob/floating-window/content/browser/webui/initial_webui_browsertest.cc#L144)). But it only fills
 > `path_to_response_map_`, which is consumed by `PopulateWebUIResources()` for
 > the `LocalResourceLoaderConfig` path — `StartDataRequest()` never reads it.
 > Whether it worked would depend on which loading path was active. The request
@@ -289,7 +390,7 @@ ahead of the resource-ID lookup. It takes two callbacks:
 ### Why there is no script in the page
 
 Data sources get a default CSP from `URLDataSource::GetContentSecurityPolicy()`
-(`content/public/browser/url_data_source.cc:64`). For a trusted `chrome://`
+([`content/public/browser/url_data_source.cc:64`](https://github.com/obeletski/chromium/blob/floating-window/content/public/browser/url_data_source.cc#L64)). For a trusted `chrome://`
 source:
 
 | Directive | Default | Effect here |
@@ -306,13 +407,13 @@ browser pushing any color values into it.
 
 ### The metrics registration a new WebUI host requires
 
-`WebUIUrlHashesBrowserTest` (`chrome/browser/ui/webui/webui_url_hashes_browsertest.cc`)
+`WebUIUrlHashesBrowserTest` ([`chrome/browser/ui/webui/webui_url_hashes_browsertest.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/webui_url_hashes_browsertest.cc))
 walks every registered config and fails if either is missing:
 
-- `tools/metrics/histograms/metadata/ui/enums.xml`, enum `WebUIUrlHashes`, keyed
+- [`tools/metrics/histograms/metadata/ui/enums.xml`](https://github.com/obeletski/chromium/blob/floating-window/tools/metrics/histograms/metadata/ui/enums.xml), enum `WebUIUrlHashes`, keyed
   by `base::Hash("chrome://floating-window/")` as a signed 32-bit value —
   `-330093187`.
-- `tools/metrics/histograms/metadata/page/histograms.xml`, variant `WebUIHost`,
+- [`tools/metrics/histograms/metadata/page/histograms.xml`](https://github.com/obeletski/chromium/blob/floating-window/tools/metrics/histograms/metadata/page/histograms.xml), variant `WebUIHost`,
   entry `.floating-window`. (Configs deriving from `InternalWebUIConfig` are
   exempt from this second one; ours is not.)
 
@@ -334,7 +435,7 @@ Two new `source_set`s, both asserting desktop:
   `//chrome/browser/ui/views/toolbar:impl`.
 
 The button itself lives in the existing toolbar target: its header on
-`:toolbar` (whose `public` list already carries `toolbar_view.h`), its source on
+`:toolbar` (whose `public` list already carries [`toolbar_view.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/toolbar_view.h)), its source on
 `:impl`.
 
 Note the dependency direction: **toolbar → floating_window**, never the reverse.
@@ -360,16 +461,33 @@ Esc-closed captures, so both paths reach exactly the same state. No
 `FATAL`/`DCHECK`/CSP errors in the browser log.
 
 Also clean: `gn check` on both new targets, `git cl format`,
-`tools/metrics/histograms/validate_format.py`, and `pretty_print.py --presubmit`
+[`tools/metrics/histograms/validate_format.py`](https://github.com/obeletski/chromium/blob/floating-window/tools/metrics/histograms/validate_format.py), and `pretty_print.py --presubmit`
 on both edited XML files.
 
 ---
 
-## 10. Known gaps
+## 10. Regenerating the PDFs
+
+`floating-window-*.pdf` are renders of the Markdown next to them, diagrams
+included. The Markdown is the source; never edit a PDF.
+
+```sh
+docs/floating_window/tools/render-pdf.sh          # defaults to out/Linux
+```
+
+The pipeline is `marked` for Markdown, `mermaid` for the diagrams, and **this
+checkout's own `chrome`** in headless mode for `--print-to-pdf`, which avoids
+needing puppeteer or a system browser. The one non-obvious flag is
+`--virtual-time-budget=30000`: mermaid lays the diagrams out asynchronously
+after load, and without it the PDF can be printed while they are still empty.
+
+---
+
+## 11. Known gaps
 
 - **Strings are hardcoded** `u"..."` literals with TODOs, not `IDS_` messages.
   New `.grd` strings require translation screenshots that presubmit enforces,
-  which is disproportionate for a demo surface. `ai_overlay_toolbar_button.cc`
+  which is disproportionate for a demo surface. [`ai_overlay_toolbar_button.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/ai_overlay_toolbar_button.cc)
   sets the same precedent.
 - **No tests.** A `FloatingWindowToolbarButton` browser test asserting
   open/toggle/Esc would be the natural next step; the interaction is exactly
