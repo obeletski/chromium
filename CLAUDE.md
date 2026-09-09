@@ -34,9 +34,9 @@ the point is to learn how the real thing is built.
 
 ## This checkout
 
-`~/chromium-desk` — `src/` plus a sibling `../notes/` directory of orientation
-write-ups (see "Local notes" at the bottom). A second, android-only checkout
-exists at `~/chromium`; do not confuse the two.
+`~/chromium-desk/src`. The orientation write-ups that used to sit beside it in
+`../notes/` are now checked in under `docs/`, on the `digitclassifier` branch —
+see "Orientation notes" at the bottom.
 
 - **Both `android` and `linux` are synced.** `../.gclient` sets
   `target_os = ["android", "linux"]`, so host targets *do* build here.
@@ -110,6 +110,14 @@ The `digitclassifier` branch adds an experimental, non-standard Web API that
 classifies a 28x28x3 NHWC `Float32Array` (2352 floats, `[0,1]`) as `"0"`..`"9"`.
 Read `docs/digitclassifier/` **before** touching it — the session log there is
 newer than the handoff and contradicts parts of it.
+
+It is a **single squashed commit**. The incremental history — the two WebGPU
+defects found on hardware, the fixups, the session-log commits — is kept on
+`digitclassifier-details`. Their *code* is identical; `digitclassifier` is
+ahead only under `docs/` (the orientation notes, and GitHub links added to the
+existing documents). The commit messages on `-details` are the only record of
+those debugging findings, so prefer `git log digitclassifier-details` when
+asking why something is the way it is.
 
 - `docs/digitclassifier/DigitClassifier-Session-2026-08-23.md` — most recent
   state; what is proven on hardware and what is not. Read this first.
@@ -322,18 +330,33 @@ Codegen lives in `//third_party/jni_zero`.
 - Never make speculative fixes for compile errors — read the defining file first,
   and check whether the same error already appeared earlier in the session.
 
-## Local notes (`../notes/`)
+## Orientation notes — on the `digitclassifier` branch
 
-Written against this checkout; not upstream Chromium docs. The Markdown is the
-source — the two `.pdf`s are renders (`chromium-android-offline.pdf` renders
-`chromium-android-architecture.md`, despite the name).
+Three write-ups about this checkout, not upstream Chromium docs. They used to
+sit outside the tree in `../notes/`; that directory no longer exists. They are
+now checked in, but **on the `digitclassifier` branch**, so none of them are
+present here:
 
-- `chromium-android-architecture.md` — reading path and mental model: the
-  layering vs. process axes, where Blink fits, what is genuinely different on
-  Android (helper processes are Android Services, not `fork`/`exec`).
-- `digitclassifier-walkthrough.md` — file-by-file trace of the
-  `digitclassifier` branch, closing with a list of the places where in-tree
-  docs and comments are wrong.
-- `genui-chromium-directions.md` — what AI/GenUI machinery is actually in the
-  tree (Glic, Skills, Actor, on-device model plumbing) and where it could go.
-  Part I is verified against source; Parts II–V are explicitly proposals.
+- `docs/notes/chromium-android-architecture.md` — reading path and mental
+  model: the layering vs. process axes, where Blink fits, what is genuinely
+  different on Android (helper processes are Android Services, not
+  `fork`/`exec`).
+- `docs/notes/genui-chromium-directions.md` — what AI/GenUI machinery is
+  actually in the tree (Glic, Skills, Actor, on-device model plumbing) and
+  where it could go. Part I is verified against source; Parts II–V are
+  explicitly proposals.
+- `docs/digitclassifier/digitclassifier-walkthrough.md` — file-by-file trace of
+  that feature, closing with a list of the places where in-tree docs and
+  comments are wrong.
+
+Read one without switching branches:
+
+```sh
+git show digitclassifier:docs/notes/chromium-android-architecture.md | less
+```
+
+Each has a `.pdf` render beside it. The pipeline that produces them —
+Markdown through `marked` and `mermaid`, then this checkout's own headless
+`chrome` for `--print-to-pdf` — is `docs/floating_window/tools/render-pdf.sh`,
+which lives on *this* branch and is hardcoded to `docs/floating_window`. Point
+`DOC_DIR` elsewhere to reuse it.
