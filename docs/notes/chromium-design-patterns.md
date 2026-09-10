@@ -61,7 +61,20 @@ The document is unusually blunt about the trade-off:
 > useful for solving specific problems, but in general it is overused in
 > Chromium.**
 
-The four flavours, and the tree's own decision rules:
+The family has four members, and the decision tree below picks between them, so
+they need naming first:
+
+* **Callback** — a `base::OnceCallback` or `RepeatingCallback` handed to the
+  framework, which runs it. No interface, no inheritance, no registration.
+* **Listener** — an interface with a single event on it, at most one instance
+  per framework object. A pre-lambda construct; do not write new ones.
+* **Observer** — an interface with several events on it, any number of
+  registered instances, notified of things that have already happened. All
+  methods return `void`.
+* **Delegate** — an interface the framework consults *while* doing something, to
+  make a decision or supply a missing piece. Its methods return values.
+
+With those named, the tree's own rules for choosing:
 
 ```mermaid
 flowchart TD
@@ -285,7 +298,18 @@ is conventionally the address of a static (or of the consumer instance itself,
 when there can be several).
 
 What matters in practice is that Chromium has a **ladder of scopes**, and each
-rung has its own typed helper. Choosing the right rung is the design decision:
+rung has its own typed helper. Choosing the right rung is the design decision.
+
+Every rung below is a browser-process object, and each names the thing whose
+lifetime bounds the data attached to it. The four long-lived ones are the
+product concepts from §6 — process, profile, browser window, tab. The four
+short-lived ones are `//content` primitives and are worth knowing apart, because
+they look interchangeable and are not: a **`WebContents`** is the renderer-backed
+object a tab holds, and survives navigation; a **`Page`** is one primary page
+within it, replaced on a cross-document navigation; a **`Document`** is one DOM
+document, so a same-document navigation keeps it and a reload does not; and a
+**`NavigationHandle`** exists only for the duration of a single navigation
+attempt, which may never commit at all.
 
 ```mermaid
 flowchart TD
@@ -711,7 +735,13 @@ others:
 ## 14. One feature, read as a stack of patterns
 
 The floating-window feature is small enough to hold in one diagram and uses
-seven of the patterns above.
+seven of the patterns above. Every box is a browser-process object:
+`FloatingWindowToolbarButton` is the toolbar control (§3), `BubbleDialogDelegate`
+and `views::WebView` are the views classes behind the floating surface (§4),
+`FloatingWindowUIConfig` and `FloatingWindowUI` are the WebUI registry entry and
+its controller (§8), and `OutlineCollector` and `TabEntry` are the file-local
+helpers in `floating_window_ui.cc` that gather the outlines and hold one row's
+worth of data (§7).
 
 ```mermaid
 flowchart TD
