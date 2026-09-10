@@ -204,19 +204,139 @@ snapshot_targets[i]->RequestAXTreeSnapshot(
     ...);
 ```
 
-Three separate mechanisms in one expression:
+Three separate mechanisms in one expression, unpacked in the next three
+subsections. The target is
+`WebContents::AXTreeSnapshotCallback = base::OnceCallback<void(ui::AXTreeUpdate&)>`
+(`content/public/browser/web_contents.h:645`) — note the **non-const lvalue
+reference**, which is what forces the third mechanism.
 
-1. `base::BindOnce(&Method, collector, row)` — binding a method with a
-   `scoped_refptr` receiver, which keeps the object alive for the callback's
-   lifetime. No `Unretained` needed, and no weak pointer either.
-2. `mojo::WrapCallbackWithDefaultInvokeIfNotRun(cb, default_args...)` — covers
-   the `Dropped` edge in the diagram above: if the reply callback is
-   *destroyed* without running (the renderer went away), the default arguments
-   are invoked instead. Without it that tab never resolves.
-3. `base::OwnedRef(std::move(on_failure))` — the default argument is a move-only
-   `AXTreeUpdate`, and `OnSnapshot` takes it by non-const reference. `OwnedRef`
-   stores it inside the callback and passes a reference to it, which neither a
-   plain bound value nor `base::Owned` would do.
+#### The receiver: a `scoped_refptr` bound as `this`
+
+`base::BindOnce(&OutlineCollector::OnSnapshot, collector, row)` binds a pointer
+to member function whose signature is `void(size_t, ui::AXTreeUpdate&)`.
+`collector` is a `scoped_refptr<OutlineCollector>`, and `base::Bind*`
+understands that: it stores a **reference-counted handle**, so the object stays
+alive exactly as long as the callback does. That is why no `base::Unretained`
+and no `WeakPtr` appear — and it is the mechanism by which the collector
+outlives the function that created it. The outstanding reply callbacks *are*
+what keep it alive.
+
+With the receiver and `row` bound, the one remaining parameter is
+`ui::AXTreeUpdate&`, so the result matches `AXTreeSnapshotCallback` exactly.
+
+#### The drop guard, and how it works
+
+`mojo::WrapCallbackWithDefaultInvokeIfNotRun()` covers the `Dropped` edge in the
+state diagram above. Its header states the contract
+(`mojo/public/cpp/bindings/callback_helpers.h:15`): if the callback is destroyed
+before it can run — the task was dropped, the renderer went away — it is run
+with the default arguments instead.
+
+Worth knowing the implementation, because it explains the caveats. It
+heap-allocates a helper and returns a callback that *owns* it:
+
+```cpp
+return base::BindOnce(&internal::CallbackWithDeleteHelper<T>::Run,
+                      std::make_unique<internal::CallbackWithDeleteHelper<T>>(
+                          std::move(cb), std::forward<Args>(args)...));
+```
+
+The helper pre-binds "run me with the defaults" into `delete_callback_`, then:
+
+```cpp
+~CallbackWithDeleteHelper() { if (delete_callback_) std::move(delete_callback_).Run(); }
+void Run(Args... args) { delete_callback_.Reset(); std::move(callback_).Run(...); }
+```
+
+so exactly one of the two paths fires — `Run()` disarms the destructor first.
+Two caveats the header raises itself: the destructor may run on a thread you did
+not expect (not an issue for mojo async replies, which run and destroy on the
+`Remote`'s thread), and **nothing in the type advertises the special destructor
+behaviour**, so these should not be passed deep into call graphs where a reader
+cannot tell whether `Run()` is expected.
+
+#### `base::OwnedRef`, and why nothing simpler compiles
+
+The default argument has to satisfy `ui::AXTreeUpdate&`. Every simpler option is
+rejected:
+
+* a temporary is a prvalue and will not bind to a non-const lvalue reference;
+* a plain bound value fails too, because `BindOnce` passes bound arguments to
+  the target as rvalues;
+* `base::Owned()` passes a `T*`, and the parameter is not a pointer.
+
+This is not a special case — `base::Bind*` **refuses** to bind a plain value to
+any non-const reference parameter, by `static_assert`
+(`base/functional/bind_internal.h:1602`):
+
+> "Bound argument for non-const reference parameter must be wrapped in
+> `std::ref()` or `base::OwnedRef()`."
+
+The refusal is deliberate, because `void f(int& out)` is ambiguous at the bind
+site: mutate *the caller's* variable, or give the function scratch storage?
+Those have opposite lifetime requirements, so the tree makes you say which.
+`docs/callback.md:814` shows the pair:
+
+```cpp
+int n = 0;
+auto has_ref  = base::BindRepeating(&foo, std::ref(n));        // the caller's n
+auto has_copy = base::BindRepeating(&foo, base::OwnedRef(n));  // the callback's copy
+auto broken   = base::BindRepeating(&foo, n);                  // does not compile
+```
+
+`std::ref` borrows and obliges you to outlive the callback; `OwnedRef` copies
+and obliges you to nothing. The implementation is nine lines
+(`bind_internal.h:375`) and two details carry it:
+
+```cpp
+class OwnedRefWrapper {
+ public:
+  explicit OwnedRefWrapper(const T& t) : t_(t) {}
+  explicit OwnedRefWrapper(T&& t) : t_(std::move(t)) {}
+  T& get() const { return t_; }
+ private:
+  mutable T t_;          // by value -> the callback owns it
+};                       // mutable  -> get() const can still yield a non-const T&
+```
+
+`mutable` is the trick: bound arguments are unwrapped through a `const&`
+(`BindUnwrapTraits::Unwrap(const T& o) { return o.get(); }`), and without it a
+*mutable* reference could not come back out of a const-accessed bind state.
+
+The second documented use is the one in play here — `bind.h:346` calls it
+"useful to pass placeholder arguments", with an example whose parameter is
+literally named `ignore`:
+
+```cpp
+void bar(int& ignore, const std::string& s);
+OnceClosure cb = base::BindOnce(&bar, base::OwnedRef(0), "Hello");
+```
+
+`OwnedRef(0)` conjures scratch storage from a literal, which `std::ref` cannot
+do — there is no object to refer to. `on_failure` is exactly that: a placeholder
+nobody reads.
+
+#### `std::move()` moves nothing
+
+`std::move(on_failure)` is worth a note because it looks like an optimisation
+and is not one. It is a cast —
+`static_cast<std::remove_reference_t<T>&&>` — producing an **xvalue**. No bytes
+move. All it changes is overload resolution: `on_failure` is an lvalue and would
+select `OwnedRefWrapper(const T&)`; the cast selects `OwnedRefWrapper(T&&)`.
+
+Here that buys close to nothing, because `on_failure` is default-constructed and
+never written to — two empty vectors and a default `AXTreeData`, as cheap to
+copy as to move. (`AXTreeUpdate` is copyable *and* movable;
+`ui/accessibility/ax_tree_update.h:54-59` declares both, with a TODO about
+auditing the copy sites.) The `std::move` is there for intent and robustness:
+it says the local is dead after this line, and it stays correct if the fallback
+ever gains content.
+
+One detail that is load-bearing and easy to undo: `on_failure` is declared
+**inside** the request loop, so each iteration moves from a fresh object. Hoisting
+it above the loop — a tempting tidy-up — would have every later iteration move
+from an already-moved-from value. That is well-defined but unspecified, and
+harmless only for as long as the object stays empty.
 
 ### Combinators
 
@@ -668,17 +788,106 @@ Small things that repeatedly stop a first-time reader.
   `callback->AsUserdata()` (`digit_classifier.cc:157`) is how a C++ callback is
   handed to a C API that takes a function pointer and a `void*`.
   `MakeWGPUOnceCallback` owns the pair and deletes itself when invoked.
-* **`base::FunctionRef` for visitors.** `browser_collection.h:54` declares
-  `void ForEach(base::FunctionRef<bool(BrowserWindowInterface*)>, Order)`, so
-  `floating_window_ui.cc:557` passes a capturing lambda — legal here precisely
-  because `FunctionRef` is synchronous and non-owning, where `base::BindRepeating`
-  would have rejected the capture. **Returning `true` means "keep iterating"**,
-  which is the opposite of what `false`-to-continue APIs elsewhere mean; read the
-  declaration, do not guess.
+* **`base::FunctionRef` for visitors** — enough of a trap on its own that it has
+  its own subsection, §11.1 below.
 * **`std::to_underlying(e)`** (1,144) rather than `static_cast<int>` for enum
   classes — allowed C++23, and it cannot silently pick the wrong width.
 * **`GSL_OWNER`, `[[nodiscard]]` (2,517), `constinit` (144)** as ordinary
   annotations on declarations.
+
+### 11.1 Lambdas: when `[&]` is allowed, and when it will not compile
+
+Chromium's rules about lambdas are about *lifetime*, never about syntax, and two
+different APIs enforce them in opposite directions.
+
+**`base::Bind*` rejects capturing lambdas outright**, by `static_assert`
+(`base/functional/bind_internal.h:1756`):
+
+> "Capturing lambdas and stateful functors are intentionally not supported. Use
+> a non-capturing lambda or stateless functor (i.e. has no non-static data
+> members) and bind arguments directly."
+
+The intent is that state a callback needs must be spelled out as *bound
+arguments*, where every unsafe decision carries a greppable name — `Unretained`,
+`Owned`, `OwnedRef`, a `WeakPtr`. A capture list hides all of that behind two
+characters. Same reason `std::bind` is banned in favour of `base::Bind*`.
+
+**`base::FunctionRef` invites them.** Its header
+(`base/functional/function_ref.h:23`) defines it as a non-owning reference for
+callees that "do not need to copy or take ownership" and "**synchronously** call
+the invocable" — the same family as `std::string_view` and `base::span`, with
+the same warning that storing or returning one is a lifetime bug. That
+synchronous-call promise is exactly the condition under which Google style
+permits default capture by reference, and `docs/patterns/builder-lambda.md`
+words the exemption well: fine when the lambda "can never escape the current
+scope and obviously is shorter-lived than any of the captured variables."
+
+The tree goes further than permitting it. Converting a `OnceCallback` into a
+`FunctionRef` is a `static_assert(false)` (`base/functional/callback.h:271`):
+
+> "using `base::BindOnce()` is not necessary with `base::FunctionRef`; is it
+> possible to use a capturing lambda directly?"
+
+So for a `FunctionRef` parameter, `[&]` is not merely tolerated — it is the
+intended spelling.
+
+**The signal to read is the parameter type, not the lambda.** `FunctionRef`
+means synchronous, so `[&]` is safe. `OnceCallback` / `RepeatingCallback` means
+it may be stored and run later, so lifetimes need named wrappers.
+
+A worked example, `floating_window_ui.cc:557`:
+
+```cpp
+collection->ForEach(
+    [&](BrowserWindowInterface* browser) {
+      if (browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
+          browser->IsDeleteScheduled()) {
+        return true;  // Keep iterating.
+      }
+      ...
+    },
+    BrowserCollection::Order::kCreation);
+```
+
+`[&]` captures three locals of the enclosing function and cannot outlive the
+statement. Two further things in those five lines are worth knowing:
+
+* **`return true` means *continue*.** The header is explicit
+  (`browser_collection.h:44`): "true means continue, false means terminate." The
+  early return is a `continue`, not a `break`. Other APIs in the tree use
+  `false` to continue, so read the declaration rather than guessing.
+* **The callback form is not stylistic.** `GetAllBrowserWindowInterfaces()`
+  returns a `std::vector` and exists, but `ForEach()` wraps the loop in a
+  `BrowserCollectionEnumerator`
+  (`chrome/browser/ui/browser_window/internal/browser_collection.cc:18`) — a
+  temporary that **observes the collection for the duration of the iteration**
+  through `base::ScopedObservation`, holds its own snapshot, and patches that
+  snapshot as windows close:
+
+  ```cpp
+  void OnBrowserClosed(BrowserWindowInterface* browser) override {
+    auto it = std::ranges::find(browsers_, browser);
+    if (it != browsers_.end()) { *it = nullptr; }   // skipped during iteration
+  }
+  void ForEach(base::FunctionRef<bool(BrowserWindowInterface*)> on_browser) {
+    for (size_t index = 0; index < browsers_.size(); index++) {
+      if (browsers_[index] && !on_browser(browsers_[index])) { return; }
+    }
+  }
+  ```
+
+  A vector handed back to the caller is a dead snapshot — nothing can correct it
+  when a window closes mid-iteration. *That* is why the callback form is
+  preferred, not the syntax. Re-reading `browsers_.size()` each iteration is
+  additionally what makes the `enumerate_new_browsers` option work.
+
+**Standard-C++ footnotes**, since the capture clause has grown repeatedly:
+`[x = expr]` init-capture (C++14) is the move-capture mechanism; `[*this]`
+(C++17) copies the enclosing object, where `[=]` only ever captured the `this`
+*pointer*; implicit `this` capture through `[=]` is **deprecated in C++20**, so
+write `[=, this]` or `[*this]` to say which you meant; `[&]` captures only what
+the body odr-uses, not everything in scope; and variables with static storage
+duration are never captured, just used.
 
 ---
 
