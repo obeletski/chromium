@@ -579,22 +579,77 @@ differs on every request — see [Why the table is rendered in
 C++](#why-the-table-is-rendered-in-c-and-not-by-script).
 
 `SetRequestFilter()` is the escape hatch — it lets a source compute a response
-in C++, and it is checked **first** in `WebUIDataSourceImpl::StartDataRequest()`,
-ahead of the resource-ID lookup. It takes two callbacks:
+in C++. It takes **two** callbacks, a predicate and a producer
+([`web_ui_data_source.h`](https://github.com/obeletski/chromium/blob/floating-window/content/public/browser/web_ui_data_source.h#L141)):
+
+```cpp
+typedef base::RepeatingCallback<bool(const std::string&)> ShouldHandleRequestCallback;
+using  HandleRequestCallback =
+    base::RepeatingCallback<void(const std::string&, GotDataCallback)>;
+```
+
+The split matters because the predicate is consulted for **every** request to
+the host, and answering `false` falls through to the ordinary resource-ID path.
+`WebUIDataSourceImpl::StartDataRequest()`
+([`.cc`](https://github.com/obeletski/chromium/blob/floating-window/content/browser/webui/web_ui_data_source_impl.cc#L508)) shows
+that the filter is checked *ahead* of the `AddResourcePath()` lookup, and
+short-circuits it entirely:
+
+```cpp
+if (!should_handle_request_callback_.is_null() &&
+    should_handle_request_callback_.Run(path)) {
+  filter_callback_.Run(path, std::move(callback));
+  return;                        // the resource-ID lookup never happens
+}
+```
+
+That is what makes the filter the only one of the two paths able to produce a
+*different* document per request — the requirement here, since the page lists
+live tab state.
 
 - `ShouldHandleRequest(path)` — returns `true` unconditionally here, so any path
   under the host serves the same document and a stray trailing segment does not
   produce a blank window.
 - `HandleRequest(profile, path, callback)` — hands back
   `base::RefCountedString`. The response goes through a *callback* rather than a
-  return value because sources are allowed to answer asynchronously; this one
-  runs it immediately, since tab strips are plain browser-process state on the
-  same thread.
+  return value because sources are allowed to answer asynchronously, and since
+  the outlines were added this one genuinely does: the tab list is read inline,
+  but the callback is moved into an `OutlineCollector` and run later. See
+  [Going asynchronous](#going-asynchronous).
 
-  The `Profile*` is bound into the callback with `base::BindRepeating` in the
-  `FloatingWindowUI` constructor. A raw pointer is safe because the data source
-  is owned by the `URLDataManager` keyed on that same `BrowserContext`, so the
-  source — and therefore the callback — cannot outlive the profile.
+Both are registered in one statement, and its shape repays a look:
+
+```cpp
+source->SetRequestFilter(
+    base::BindRepeating(&ShouldHandleRequest),
+    base::BindRepeating(&HandleRequest, base::Unretained(profile)));
+```
+
+- **`RepeatingCallback`, not `Once`.** The data source outlives any single
+  navigation and answers every request to the host — reloads, a second window,
+  `/anything`. Note the contrast with the `GotDataCallback` *inside* the second
+  signature, which is a `OnceCallback`: one response per request. Two different
+  lifetimes declared in one line.
+- **The first bind is degenerate.** `base::BindRepeating(&ShouldHandleRequest)`
+  binds no arguments at all; it exists only because the parameter is a
+  `RepeatingCallback` and a bare function pointer does not implicitly convert.
+  Nothing is kept alive, so there is no lifetime question.
+- **The second bind is partial application, and it is load-bearing.**
+  `HandleRequest` takes *three* parameters while `HandleRequestCallback` is
+  declared with *two*. Binding `profile` as the **leading** argument consumes the
+  first parameter, leaving `(const std::string&, GotDataCallback)` — exactly the
+  required signature. This is how a free function is given context without a
+  class or a global, and it is where profile scoping comes from: the profile the
+  data source was registered for is baked into the callback, which is why an
+  Incognito floating window cannot list regular-profile tabs.
+- **`base::Unretained(profile)` is a claim, not a cast.** `base::Bind*` refuses
+  to bind a bare raw pointer, so the lifetime decision has to be named. The proof
+  here is structural: the data source is owned by the `URLDataManager` keyed on
+  that same `BrowserContext`, so the source — and therefore the callback —
+  cannot outlive the profile. The alternatives do not fit. `Profile` is not
+  ref-counted, so `RetainedRef` is out; a `WeakPtr` would need a factory on
+  `Profile` and would silently do nothing once null, which for a data source
+  means a navigation that hangs rather than a visible failure.
 
 ### How the HTML is generated
 
@@ -840,7 +895,17 @@ Four choices in that chain are worth pausing on.
   null-checked.
 - **`ForEach()`, not `GetAllBrowserWindowInterfaces()`.** The callback form
   exists specifically so a window destroyed mid-iteration cannot leave a
-  dangling pointer behind (crbug.com/405910169). The header says so directly.
+  dangling pointer behind (crbug.com/405910169). The header says so directly,
+  and the mechanism is worth knowing because it is not obvious from the
+  signature: `ForEach()` wraps the loop in a `BrowserCollectionEnumerator`
+  ([`browser_collection.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/browser_window/internal/browser_collection.cc#L18)),
+  a temporary that observes the collection for the duration of the iteration via
+  `base::ScopedObservation`, keeps its own snapshot, and **nullifies entries in
+  that snapshot** from `OnBrowserClosed()` so the loop skips them. A
+  `std::vector` handed back to the caller is a dead snapshot that nothing can
+  correct. The lambda's `return true` means *keep iterating* — the header
+  states it plainly, and it is the opposite of several other in-tree
+  visitor APIs.
 - **`Order::kCreation`, not `kActivation`.** Activation order is runtime state
   that changes whenever the user focuses a window, so an activation-ordered
   table would reshuffle itself between openings for no reason the user could

@@ -23,6 +23,17 @@ usual trade-offs:
 - Per-feature notes belong in `docs/<feature>/`, and are worth writing at length
   (see `docs/digitclassifier/`, `docs/floating_window/`). Anything that would be
   disproportionate for an upstream CL is probably right here.
+- **Name every entity in a diagram before the diagram uses it.** Every
+  participant, node and state in a mermaid diagram must have a one-line
+  description in the surrounding prose — what the thing *is*, which process it
+  lives in, and where it is declared — placed before the first diagram that
+  names it, or immediately after. A diagram shows *interactions*, and an
+  interaction between two things the reader cannot identify conveys nothing;
+  worse, it invites them to guess, and the guess is usually that an arrow's
+  source is the thing that acts. For anything more than a one-liner, give it its
+  own subsection with its interface, its members and its invariants, ahead of
+  the subsections that explain its behaviour. Explaining what an object *does*
+  is not a substitute for saying what it *is*.
 
 Two conventions that upstream would enforce and we deliberately skip, because
 both cost more than they are worth for code that will not ship: `IDS_` strings

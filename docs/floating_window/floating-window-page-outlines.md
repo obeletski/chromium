@@ -69,6 +69,36 @@ The page is served by a `WebUIDataSource` request filter, unchanged since the
 feature rendered one line of static text. What changed is *when* the filter can
 answer.
 
+**The participants.** Everything below except the renderers runs in the
+**browser process**, on the UI thread. Two of the four names are shorthand
+rather than classes, which is worth knowing before reading arrows into them:
+
+* **Navigation** — not a class. Shorthand for the URL-loading machinery that
+  services a navigation to `chrome://floating-window`. Concretely it is
+  [`WebUIURLLoaderFactory`](https://github.com/obeletski/chromium/blob/floating-window/content/browser/webui/web_ui_url_loader_factory.cc),
+  whose `StartURLLoader()` builds the `GotDataCallback` and hands it to the data
+  source. That callback is `DataAvailable` bound to a
+  `mojo::PendingRemote<network::mojom::URLLoaderClient>` — so "running the
+  callback" is literally what pushes the bytes down the URL load to the
+  renderer. Nothing else in this document delivers the page.
+* **`HandleRequest()`** — a **free function**, not a class or a method, declared
+  in the anonymous namespace of
+  [`floating_window_ui.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_ui.cc#L512). It reaches the data source as
+  `base::BindRepeating(&HandleRequest, base::Unretained(profile))` passed to
+  `WebUIDataSource::SetRequestFilter()`
+  ([`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_ui.cc#L668)), and
+  [`WebUIDataSourceImpl::StartDataRequest()`](https://github.com/obeletski/chromium/blob/floating-window/content/browser/webui/web_ui_data_source_impl.cc#L508)
+  runs it *instead of* the usual resource-ID lookup. Being a free function
+  matters: it owns no state and cannot outlive the call, which is precisely why
+  something else has to hold the callback.
+* **Browser state** — also shorthand: the tab bookkeeping the browser already
+  holds, walked synchronously as
+  `ProfileBrowserCollection` → `BrowserWindowInterface` → `TabStripModel` →
+  `WebContents`. §1 diagrams it. No IPC, no waiting, cannot fail.
+* **Renderers** — one renderer process per tab (per site, strictly), each
+  holding the DOM whose headings we want. The only participant outside the
+  browser process.
+
 ```mermaid
 sequenceDiagram
   autonumber
@@ -77,11 +107,11 @@ sequenceDiagram
   participant B as Browser state
 
   Note over N,B: Before — tab table only
-  N->>HR: StartDataRequest
+  N->>HR: StartDataRequest(path, GotDataCallback)
   HR->>B: walk tab strips
   B-->>HR: titles, URLs, indices
-  HR-->>N: callback.Run(html)
-  Note right of HR: same call stack,<br/>microseconds
+  HR->>N: std::move(callback).Run(html)
+  Note right of HR: HandleRequest still owns the<br/>callback and runs it itself,<br/>on the same stack, in microseconds
 ```
 
 ```mermaid
@@ -90,19 +120,50 @@ sequenceDiagram
   participant N as Navigation
   participant HR as HandleRequest
   participant B as Browser state
-  participant R as Renderers
+  participant OC as OutlineCollector<br/>browser
+  participant R as Renderers<br/>one per live tab
 
   Note over N,R: After — plus page outlines
-  N->>HR: StartDataRequest
+  N->>HR: StartDataRequest(path, GotDataCallback)
   HR->>B: walk tab strips
   B-->>HR: titles, URLs, indices
-  HR->>R: RequestAXTreeSnapshot × N
-  HR-->>N: (returns having answered nothing)
-  Note right of HR: the callback has been<br/>moved into a collector
-  R-->>N: replies arrive, one at a time
+  HR->>OC: new OutlineCollector(tabs, std::move(callback))
+  Note right of OC: the collector now OWNS the<br/>GotDataCallback. HandleRequest<br/>no longer has one to run.
+  loop N times, one per live renderer
+    HR->>R: RequestAXTreeSnapshot
+  end
+  HR-->>N: returns, having answered nothing
   Note over N,R: …later…
-  R-->>N: callback.Run(html)
+  loop at most N times, in any order
+    R-->>OC: OnSnapshot(index, AXTreeUpdate)
+  end
+  Note over OC: the last reply — or the deadline —<br/>reaches Finish()
+  OC->>N: std::move(callback_).Run(html)
+  Note right of OC: EXACTLY ONCE, from the browser<br/>process. Guarded by finished_.
 ```
+
+Three counts, since the diagram is easy to misread. Over one page load there
+are **N** snapshot requests (one per tab with a live renderer), **at most N**
+replies arriving one at a time in whatever order the renderers manage, and
+**exactly one** `Run()`. The replies do not go to the navigation and they do not
+each produce a response — each one only decrements a counter on the collector.
+
+The object all three counts are about is `WebUIDataSource::GotDataCallback`.
+It is the second half of the request filter's signature: `StartDataRequest()`
+hands `HandleRequest()` a callback, and the response *is* running it. That is
+the thing being moved in step 4 above. Before the outlines, `HandleRequest()`
+held that callback for the few microseconds it took to build the string and ran
+it before returning. Now it gives the callback away — `std::move()`d into the
+`OutlineCollector`'s constructor — and returns having produced nothing. The
+callback is now owned by an object that outlives the call, and running it is
+what eventually publishes the page. Because it is a `OnceCallback`, running it
+is also destructive, which is why "exactly once" is a correctness requirement
+and not just an observation: see §3 on `finished_`.
+
+The fifth participant, **`OutlineCollector`**, is the one this document keeps
+coming back to, and §3 defines it properly. For now: a browser-process object
+that outlives `HandleRequest()`, owns the callback, and knows how many replies
+it is still waiting for. It exists because `HandleRequest()` cannot.
 
 The crucial part is that this needed **no new mechanism**.
 `WebUIDataSource::GotDataCallback` was always allowed to be answered later —
@@ -164,7 +225,8 @@ sequenceDiagram
   T->>OC: Finish()
   Note right of OC: pending is still 1,<br/>but the deadline does not care
   OC->>OC: BuildPageBodyHtml(tabs_)
-  OC-->>HR: callback.Run(RefCountedString) — once
+  OC->>OC: std::move(callback_).Run(RefCountedString)
+  Note right of OC: Exactly once. The bytes go to the<br/>navigation that asked for them —<br/>not back to HandleRequest, which<br/>returned long ago.
 ```
 
 > **Mermaid aside, since this document is mostly diagrams.** A `;` inside
@@ -173,6 +235,77 @@ sequenceDiagram
 > following lines until the parse fails somewhere unrelated. Quoted flowchart
 > labels are unaffected. Worth knowing before debugging a "Parse error on line
 > N" that points at an innocent line.
+
+### What the collector is
+
+`OutlineCollector` is a **ref-counted, file-local class that owns one in-flight
+gather and produces the response when it settles**. It is declared in the
+anonymous namespace of
+[`floating_window_ui.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_ui.cc#L430) — nothing outside that file has any
+reason to name it, so it never reaches a header.
+
+It exists because of a mismatch the rest of this document keeps circling: the
+request arrives once, the answers arrive N times, and the response may only be
+produced once. Something has to hold the callback across that gap and keep score.
+
+Its entire interface is five methods:
+
+```cpp
+class OutlineCollector : public base::RefCounted<OutlineCollector> {
+ public:
+  OutlineCollector(std::vector<TabEntry> tabs,
+                   content::WebUIDataSource::GotDataCallback callback);
+
+  void AddPending();                                    // ++pending_
+  void ResolveOne();                                    // --pending_, Finish() at zero
+  void OnSnapshot(size_t index, ui::AXTreeUpdate&);     // store, then ResolveOne()
+  void StartDeadline();                                 // arm the timer
+
+ private:
+  friend class base::RefCounted<OutlineCollector>;
+  ~OutlineCollector() = default;
+  void Finish();                                        // build the page, run the callback
+```
+
+and five members, each answering one question:
+
+| Member | Question it answers |
+|---|---|
+| `tabs_` | what the page will say — every row, its outline filled in as replies land |
+| `callback_` | how the page gets out — the `GotDataCallback`, moved in and owned |
+| `pending_` | how many answers are still outstanding, **plus the sentinel** |
+| `finished_` | has the callback already been run |
+| `deadline_` | the `OneShotTimer` that gives up waiting |
+
+Three invariants hold it together, and each is enforced rather than assumed:
+
+* **`Finish()` runs at most once.** `finished_` guards it, because
+  `GotDataCallback` is a `OnceCallback` and running it twice is a
+  use-after-move. Two independent paths reach it — see *The collector's states*.
+* **`pending_` never underflows.** `ResolveOne()` opens with
+  `CHECK_GT(pending_, 0u)`, so a double-resolve crashes at the bug. Without it,
+  `--pending_` would wrap a `size_t` to 2^64 and the reply path could never
+  reach zero again — the page would then be published only when the deadline
+  fired, two seconds late and missing outlines that had actually arrived. A
+  `CHECK`, not a `DCHECK`, so that holds in release builds too.
+* **The page is never published mid-issue.** That is the sentinel, next.
+
+**Why a class, and not something smaller.** Each obvious alternative fails on a
+specific point:
+
+* *A lambda capturing the callback* — it would have to outlive
+  `HandleRequest()`, and there is nothing for it to live in.
+* *A `std::unique_ptr` owned by `HandleRequest()`* — destroyed when that
+  function returns, which is before any reply arrives.
+* *`base::BarrierCallback<T>`* — the in-tree fan-in helper, and the closest
+  fit. It collects N results and fires once, which is most of this. But it can
+  only be completed by its N calls arriving: there is no way to say "stop
+  waiting now", and the deadline in §4 is the one mechanism the feature cannot
+  do without. A second, smaller mismatch is that each reply has to be written to
+  a *specific* row, and a barrier hands back an unordered vector.
+
+The remaining three subsections cover its behaviour: why `pending_` starts at
+one, the states it moves through, and what keeps it alive.
 
 ### Why the sentinel exists
 
@@ -310,6 +443,20 @@ This was tested rather than argued: a page that busy-loops its main thread for
 sixty seconds. The window still opens, that tab reads *outline unavailable*, and
 every other tab renders its outline normally.
 
+> **What the drop guard cannot express.** `WrapCallbackWithDefaultInvokeIfNotRun`
+> resolves a dropped reply by invoking `OnSnapshot()` with a default-constructed
+> `AXTreeUpdate` — and `OnSnapshot()` sets `snapshot_returned = true`
+> unconditionally. So a renderer that **dies mid-flight** produces an empty
+> outline that is indistinguishable from a page that genuinely has no `h1` or
+> `h2`, and that row renders as *"no level 1 or 2 headings"* rather than
+> *"outline unavailable"*. The distinction survives for the other two paths —
+> a renderer that was already dead at request time never gets a row set, and a
+> tab that misses `kOverallDeadline` never reports at all — so only the middle
+> column of the diagram above is mislabelled. Fixing it would take a sentinel
+> in the default value, or a separate handler bound to
+> `WrapCallbackWithDropHandler` instead. Left as-is deliberately: the label is
+> cosmetic and the alternative costs a branch on every reply.
+
 > **A note on what the deadline does not do.** It does not cancel the
 > outstanding request. The mojo callback stays alive until the renderer
 > eventually replies or goes away; `Finish()` simply stops caring. The collector
@@ -325,18 +472,70 @@ The outline is not obtained by running script in the page. It comes from
 ([`web_contents.h`](https://github.com/obeletski/chromium/blob/floating-window/content/public/browser/web_contents.h)),
 a one-shot capture that does not permanently change the accessibility mode.
 
+**`AX` is Chromium's abbreviation for *accessibility*** — it prefixes the whole
+subsystem (`AXObject`, `AXNodeData`, `AXTree`, `AXMode`, `ax::mojom::Role`), and
+`a11y`, seen in file and directory names, is the same word numeronym-style. The
+two are used interchangeably in the tree. Nothing about this feature is *for*
+assistive technology; the accessibility tree is simply the only structured,
+already-serializable view of another process's DOM that the browser can ask for.
+
+Four things take part, and only the last is ours. The **Document** is the live
+DOM in the tab's renderer. The **Blink AX tree** is the parallel tree of
+[`AXObject`](https://github.com/obeletski/chromium/blob/floating-window/third_party/blink/renderer/modules/accessibility/ax_object.h)s
+that Blink maintains beside it for assistive technology — the thing that
+actually knows what a "heading" is. **`ui::AXTreeUpdate`** is the serialized
+form that crosses the process boundary. **`ExtractOutline()`**
+([`floating_window_ui.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_ui.cc#L299))
+is the browser-side function that turns that into rows.
+
+> **Background reading, since this section only skims a large subsystem.** The
+> tree documents its own accessibility architecture, and three documents cover
+> the classes named here:
+>
+> * [`third_party/blink/renderer/modules/accessibility/readme.md`](https://github.com/obeletski/chromium/blob/floating-window/third_party/blink/renderer/modules/accessibility/readme.md)
+>   — the renderer half: `AXObject`, `AXObjectCacheImpl` (which owns the tree and
+>   defers updates until layout is clean), `WebAXObject`, and how the tree is
+>   frozen and serialized. This is the document to read before touching anything
+>   in Trap 1 or Trap 3 below.
+> * [`docs/accessibility/browser/how_a11y_works.md`](https://github.com/obeletski/chromium/blob/floating-window/docs/accessibility/browser/how_a11y_works.md)
+>   and its
+>   [Part 2](https://github.com/obeletski/chromium/blob/floating-window/docs/accessibility/browser/how_a11y_works_2.md) /
+>   [Part 3](https://github.com/obeletski/chromium/blob/floating-window/docs/accessibility/browser/how_a11y_works_3.md)
+>   — builds the architecture up from a single-process browser to the
+>   multi-process one, which is where `AXNodeData` and `AXTreeUpdate` earn their
+>   shape. Part 2 is the relevant one for the serialization boundary this
+>   section crosses.
+> * [`docs/accessibility/overview.md`](https://github.com/obeletski/chromium/blob/floating-window/docs/accessibility/overview.md)
+>   — what the subsystem is *for*, and the vocabulary. Start here if the terms
+>   are unfamiliar.
+>
+> Reading those makes the traps below look less arbitrary: they are all
+> consequences of the subsystem being built to drive platform accessibility
+> APIs, not to answer one-off structural questions about a page.
+
 ```mermaid
-graph LR
-  DOM["Document<br/><small>renderer</small>"] --> AXT["Blink AX tree<br/><small>AXObject per node</small>"]
-  AXT -->|"serialize<br/><b>gated on AXMode flags</b>"| UPD["ui::AXTreeUpdate"]
-  UPD -->|"Mojo"| BR["Browser process"]
-  BR --> FLAT["std::vector&lt;AXNodeData&gt;<br/><small>FLAT, in document order</small>"]
-  FLAT --> FLT{"IsHeading(role)<br/>and level is 1 or 2?"}
-  FLT -->|no| DROP["dropped"]
-  FLT -->|yes| NM["GetStringAttribute(kName)"]
-  NM --> CW["CollapseWhitespaceASCII"]
-  CW --> TR["TruncateUTF8ToByteSize"]
-  TR --> OUT["Heading{level, text}"]
+graph TD
+  subgraph RP["Renderer process — one per tab"]
+    DOM["Document<br/><small>the live DOM</small>"]
+    AXT["Blink AX tree<br/><small>one AXObject per node</small>"]
+    DOM --> AXT
+  end
+
+  subgraph BP["Browser process — ExtractOutline()"]
+    FLAT["ui::AXTreeUpdate<br/><small>a FLAT vector of AXNodeData,<br/>in document order</small>"]
+    FLT{"IsHeading(role)<br/>and level is 1 or 2?"}
+    DROP["dropped"]
+    NM["GetStringAttribute(kName)<br/><small>the accessible name</small>"]
+    CW["CollapseWhitespaceASCII"]
+    TR["TruncateUTF8ToByteSize"]
+    OUT["Heading{level, text}"]
+    FLAT --> FLT
+    FLT -->|no| DROP
+    FLT -->|yes| NM
+    NM --> CW --> TR --> OUT
+  end
+
+  AXT -->|"serialize, then Mojo<br/><b>gated on AXMode flags</b>"| FLAT
 
   classDef gotcha fill:#fdecc8,stroke:#8a6100,stroke-width:1.5px,color:#4a3400
   class AXT,FLAT gotcha
