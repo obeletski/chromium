@@ -29,7 +29,7 @@ third_party/blink/renderer/`, on `chrome/VERSION` 153.0.8005.0.
 | Question | Answer |
 |---|---|
 | Is threading allowed? | Yes, but you rarely create a thread. `base::Thread` appears 159 times; `base::ThreadPool::` 1,952. |
-| Are mutexes used? | Yes — `base::AutoLock` 2,275 — but task posting outnumbers them ~7:1 (`SequencedTaskRunner` + `SingleThreadTaskRunner` = 15,385). |
+| Are mutexes used? | Yes — `base::AutoLock` 2,275, across 487 files — but task posting outnumbers them ~7:1 (`SequencedTaskRunner` + `SingleThreadTaskRunner` = 15,385). |
 | Condition variables? | **18 references, tree-wide.** Effectively a `base/`-internal primitive. |
 | Reader-writer locks? | None. "Chrome doesn't expose reader-writer locks." |
 | `std::mutex`, `std::thread`, `std::condition_variable`? | **Banned.** So is `<future>`, `<latch>`, `<semaphore>`, `<barrier>`, `<stop_token>`. |
@@ -184,8 +184,9 @@ now the rare, justified case rather than the default.
 
 ## 5. Locks: allowed, common, and narrowly scoped
 
-Locks are not forbidden — `base::AutoLock` at 2,275 uses is not a rounding
-error. What is discouraged is using them as the *primary* thread-safety strategy.
+Locks are not forbidden — `base::AutoLock` at 2,275 uses across 487 files is not
+a rounding error, and there are 487 declarations of the form `base::Lock lock_;`
+to go with them. What is discouraged is using them as the *primary* thread-safety strategy.
 
 ```cpp
 class C {
@@ -327,8 +328,8 @@ you would otherwise solve badly by hand.
 | `base::Thread` | 159 | A thread that owns a message loop, so you can post to it. What you create when a dependency is genuinely thread-affine. |
 | `base::SimpleThread` / `DelegateSimpleThread` | 26 / 33 | A thread with **no** message loop — a plain `Run()` that exits. For a self-contained loop that never needs to receive tasks. |
 | `base::Thread::Options` | 75 | Where the message-pump type, stack size and `ThreadType` are chosen at creation. |
-| `base::ThreadType` | 230 | Scheduling priority as an enum — `kBackground` through `kDisplayCritical` / `kRealtimeAudio` — rather than raw nice values. |
-| `ScopedThreadPriority` | 13 | Temporarily raise priority for a scope, e.g. around a known-contended section. |
+| `base::ThreadType` | 230 | Scheduling priority as an enum — `kBackground`, `kUtility`, `kDefault`, `kPresentation`, `kAudioProcessing`, `kRealtimeAudio` — rather than raw nice values. Declared in `base/task/thread_type.h`, not under `base/threading/`. |
+| `base::ScopedBoostPriority` | 15 | Temporarily raise priority for a scope, e.g. around a known-contended section. There is no class called `ScopedThreadPriority`; that is only the header name, which also supplies the `SCOPED_MAY_LOAD_LIBRARY_AT_BACKGROUND_PRIORITY()` macro. |
 
 ### Per-thread and per-sequence storage
 
@@ -343,7 +344,7 @@ you would otherwise solve badly by hand.
 |---|---|---|
 | `base::HangWatcher` | 85 | Instantiate a `WatchHangsInScope` and the watcher reports if that scope takes longer than a timeout. How jank becomes a crash report rather than a mystery. |
 | `base::Watchdog` | 3 | An older, coarser alarm: arm it, disarm it, and it fires if you did not. |
-| `THREAD_COLLISION_WARNER` | 3 | Detects two threads entering a section that was assumed to be single-threaded — a lighter, non-fatal cousin of `SEQUENCE_CHECKER` for hot paths. |
+| `base::ThreadCollisionWarner` | 27 | Detects two threads entering a section that was assumed to be single-threaded — a lighter, non-fatal cousin of `SEQUENCE_CHECKER` for hot paths. Spelled at call sites as the `DFAKE_MUTEX` / `DFAKE_SCOPED_LOCK` macro pair (17 uses); there is no `THREAD_COLLISION_WARNER` identifier. |
 | `base::CurrentThread` | 77 | Introspection on the current message loop: is one running, add a `TaskObserver`, check whether the current thread runs tasks at all. |
 
 ### Small primitives it is easy to miss
@@ -385,7 +386,7 @@ bad — but the effect is a hard wall.
 | `std::` | Status | Chromium equivalent | The actual difference |
 |---|---|---|---|
 | `std::thread`, `std::jthread` | **banned** | `base::Thread` (159), `base::SimpleThread` (26), `base::PlatformThread` (971) | `base::Thread` owns a message loop, so you can *post* to it; a `std::thread` only runs a function. `std::jthread` has 0 uses. |
-| `std::mutex`, `std::lock_guard`, `std::unique_lock` | **banned** | `base::Lock` (487), `base::AutoLock` (2,275) | `base::Lock` is a `pthread_mutex` with `ERRORCHECK` and priority inheritance, integrates with Clang's `GUARDED_BY`, and carries the tree's lock-order and metrics instrumentation. |
+| `std::mutex`, `std::lock_guard`, `std::unique_lock` | **banned** | `base::Lock` (658 references, 487 of them declarations of the form `base::Lock lock_;`), `base::AutoLock` (2,275) | `base::Lock` is a `pthread_mutex` with `ERRORCHECK` and priority inheritance, integrates with Clang's `GUARDED_BY`, and carries the tree's lock-order and metrics instrumentation. |
 | `std::shared_mutex` | not in the banned list, but **0 uses** | — | The lexicon states it outright: "Chrome doesn't expose reader-writer locks." The sanctioned alternative is an immutable global initialised once. |
 | `std::condition_variable` | **banned** | `base::ConditionVariable` (18) | Both exist; both are avoided. §6 explains why — waiting is restricted at runtime, not just discouraged. |
 | `std::future`, `std::promise`, `std::async` | **banned** | `PostTaskAndReplyWithResult` (1,221) | The closest and most instructive pair. Both express "compute elsewhere, get the value back", but a `std::future` is collected by **blocking** on `get()`, while the Chromium version delivers the result as a **callback on your sequence**. That inversion is the whole design. |
@@ -446,7 +447,556 @@ for ordinary ones. Cross-thread work in Blink goes through the explicit
 
 ---
 
-## 12. What is verified here, and what is not
+## 12. Snippet reference
+
+Every Chromium threading name used above, with the shortest call that shows its
+real shape. Each entry points at the header that declares it as `path:line`, as
+read in this checkout — `base/` drifts, so treat a snippet older than the tree
+with suspicion rather than copying it.
+
+Two conventions throughout: `FROM_HERE` is the `base::Location` macro that gives
+the scheduler a source position for tracing, and every `base::BindOnce` that
+names a member function needs a lifetime decision for its first argument (§7).
+
+### Posting and replying
+
+**`base::OnceClosure`** — `base/functional/callback_forward.h:19`. The unit of
+work; everything below moves one of these around.
+
+```cpp
+base::OnceClosure task = base::BindOnce(&DoThing, arg);  // OnceCallback<void()>
+std::move(task).Run();  // OnceClosure is consumed by running it
+```
+
+**`base::ThreadPool::PostTask`** — `base/task/thread_pool.h:115`. Fire-and-forget
+on a pool worker. Tasks posted this way may run **in parallel with each other**;
+they are on no sequence. Returns `false` only if shutdown means it definitely
+will not run.
+
+```cpp
+base::ThreadPool::PostTask(
+    FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+    base::BindOnce(&WriteCacheFile, path));
+```
+
+**`base::ThreadPool::CreateSequencedTaskRunner`** —
+`base/task/thread_pool.h:176`. The usual entry point to §3's model: a handle
+whose tasks run one at a time, in order, on whichever worker is free.
+
+```cpp
+scoped_refptr<base::SequencedTaskRunner> runner =
+    base::ThreadPool::CreateSequencedTaskRunner(
+        {base::MayBlock(), base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN});
+runner->PostTask(FROM_HERE, base::BindOnce(&Step1));
+runner->PostTask(FROM_HERE, base::BindOnce(&Step2));  // never before Step1
+```
+
+**`base::SequencedTaskRunner`** — `base/task/sequenced_task_runner.h:192`. The
+handle itself. `PostTask()` is not declared here: it is inherited from
+`TaskRunner` (`base/task/task_runner.h:68`), which is why grepping this header
+for it comes up empty.
+
+```cpp
+scoped_refptr<base::SequencedTaskRunner> runner =
+    base::SequencedTaskRunner::GetCurrentDefault();      // :339
+runner->PostDelayedTask(FROM_HERE, base::BindOnce(&Retry), base::Seconds(1));
+```
+
+**`base::SingleThreadTaskRunner`** — `base/task/single_thread_task_runner.h:41`.
+Same API, stronger promise: one physical thread. In the browser process you
+almost never construct one — you ask `content` for the existing UI or IO thread
+(`content/public/browser/browser_thread.h:68`).
+
+```cpp
+scoped_refptr<base::SingleThreadTaskRunner> ui =
+    content::GetUIThreadTaskRunner({});
+ui->PostTask(FROM_HERE, base::BindOnce(&UpdateOmnibox));
+```
+
+**`PostTaskAndReplyWithResult`** — `base/task/task_runner.h:153` (member on any
+runner) and `base/task/thread_pool.h:105` (static, default traits). The
+workhorse. Note the argument order: *task first, reply second*, and the reply
+runs on the sequence that called this.
+
+```cpp
+base::ThreadPool::PostTaskAndReplyWithResult(
+    FROM_HERE, {base::MayBlock()},
+    base::BindOnce(&ReadWholeFile, path),                        // pool
+    base::BindOnce(&Self::OnRead, weak_factory_.GetWeakPtr()));  // back here
+```
+
+The `std::` shape it replaces, for contrast — this is the inversion §9 is about:
+
+```cpp
+std::future<std::string> f = std::async(&ReadWholeFile, path);
+std::string data = f.get();   // banned: parks the calling thread until done
+```
+
+**`base::BindPostTask`** — `base/task/bind_post_task.h:68` (a
+`RepeatingCallback` overload is at `:85`). Wraps a callback so that running it
+anywhere hops to your runner first. The way to hand a callback to code that
+knows nothing about your sequence.
+
+```cpp
+device_->SetDoneCallback(base::BindPostTask(
+    base::SequencedTaskRunner::GetCurrentDefault(),
+    base::BindOnce(&Self::OnDone, weak_factory_.GetWeakPtr())));
+```
+
+**`base::CancelableTaskTracker`** — `base/task/cancelable_task_tracker.h:60`.
+Cancellation by id rather than by lifetime. The trap is the first parameter:
+a raw `TaskRunner*`, not a `scoped_refptr`, so pass `runner.get()`.
+
+```cpp
+base::CancelableTaskTracker tracker_;                              // member
+base::CancelableTaskTracker::TaskId id = tracker_.PostTaskAndReply(
+    runner.get(), FROM_HERE, base::BindOnce(&Load), base::BindOnce(&OnLoaded));
+tracker_.TryCancel(id);       // :121 — the reply is then guaranteed not to run
+```
+
+**`base::DeferredSequencedTaskRunner`** —
+`base/task/deferred_sequenced_task_runner.h:26`. Accepts tasks before there is
+anywhere to run them. `Start()` (`:53`) is for the constructor that already took
+a target runner; the no-arg constructor pairs with `StartWithTaskRunner()`
+(`:56`), and mixing the two fails.
+
+```cpp
+auto deferred = base::MakeRefCounted<base::DeferredSequencedTaskRunner>();
+deferred->PostTask(FROM_HERE, base::BindOnce(&Early));  // queued, not run
+deferred->StartWithTaskRunner(real_runner);             // drains, in order
+```
+
+**`base::PostJob` / `base::JobHandle`** — `base/task/post_job.h:196` / `:88`.
+Data-parallel work splitting. Two callbacks: the worker task, run concurrently
+by up to N workers, and a `MaxConcurrencyCallback` (`:148`,
+`RepeatingCallback<size_t(size_t worker_count)>`) that the pool polls to decide
+how many to run.
+
+```cpp
+base::JobHandle handle = base::PostJob(
+    FROM_HERE, {base::TaskPriority::USER_BLOCKING},
+    base::BindRepeating(&ProcessItems, base::Unretained(&queue)),
+    base::BindRepeating(&ItemsRemaining, base::Unretained(&queue)));
+handle.Join();   // :120 — a JobHandle must be Join()ed or Cancel()led (:124)
+```
+
+**`base::BarrierClosure`** — `base/barrier_closure.h:23`. N callers, one
+continuation. Nothing waits; the last caller runs `done_closure` on its own
+thread.
+
+```cpp
+base::RepeatingClosure barrier =
+    base::BarrierClosure(loaders.size(), base::BindOnce(&AllDone));
+for (auto& loader : loaders)
+  loader->Start(barrier);   // each Run()s it exactly once when finished
+```
+
+**`base::SequenceBound<T>`** — `base/threading/sequence_bound.h:105`. Owns a `T`
+on another sequence and makes touching it directly impossible. Adapted from the
+header's own example (`:101`); `Then()` is *required* when the method returns
+non-void (`:205`).
+
+```cpp
+base::SequenceBound<Database> db_{backend_runner_, "profile.db"};  // ctor :129
+db_.AsyncCall(&Database::Query)
+    .WithArgs(5)
+    .Then(base::BindOnce(&Self::OnResult, weak_factory_.GetWeakPtr()));
+```
+
+**`base::WeakPtr`** — `base/memory/weak_ptr.h:362` (`WeakPtrFactory`). The
+default cancellation mechanism: a task bound to a dead receiver is dropped
+instead of run. The factory must be the **last** member so it is destroyed
+first, and it is sequence-affine — invalidation and dereference must happen on
+the same sequence.
+
+```cpp
+ private:
+  base::WeakPtrFactory<Self> weak_factory_{this};   // last member
+// ...
+runner->PostTask(FROM_HERE,
+                 base::BindOnce(&Self::OnDone, weak_factory_.GetWeakPtr()));
+```
+
+### Locks
+
+**`base::Lock` / `base::AutoLock` / `GUARDED_BY`** —
+`base/synchronization/lock.h:25`, `base/synchronization/lock.h:131` (`AutoLock`
+is a `using`, not a class, which is why it has no header of its own), and
+`base/thread_annotations.h:59`. The whole idiom, as in §5:
+
+```cpp
+base::Lock lock_;
+Data data_ GUARDED_BY(lock_);
+// ...
+{
+  base::AutoLock auto_lock(lock_);   // Acquire() in ctor, Release() in dtor
+  data_.Mutate();                    // reading data_ outside this fails to build
+}
+```
+
+`GUARDED_BY_CONTEXT(sequence_checker_)` (`base/thread_annotations.h:251`) is the
+same annotation pointed at a `SEQUENCE_CHECKER` instead of a lock — the
+sequence-shaped version of the same compile-time check.
+
+### Waiting, and the permission to wait
+
+**`base::WaitableEvent`** — `base/synchronization/waitable_event.h:56`. Both
+constructor arguments default (`ResetPolicy::MANUAL`,
+`InitialState::NOT_SIGNALED`, `:69`), which is worth spelling out anyway because
+`AUTOMATIC` versus `MANUAL` decides whether one `Signal()` releases one waiter or
+all of them.
+
+```cpp
+base::WaitableEvent done(base::WaitableEvent::ResetPolicy::MANUAL,
+                         base::WaitableEvent::InitialState::NOT_SIGNALED);
+runner->PostTask(FROM_HERE, base::BindOnce(&Work, base::Unretained(&done)));
+done.Wait();      // :103 — only where waiting is permitted; see below
+```
+
+**`base::WaitableEventWatcher`** —
+`base/synchronization/waitable_event_watcher.h:75`. The "call me when" form.
+`EventCallback` is `OnceCallback<void(WaitableEvent*)>` (`:81`), so the handler
+takes the event back as an argument.
+
+```cpp
+base::WaitableEventWatcher watcher_;                                    // member
+watcher_.StartWatching(                                                 // :97
+    &event_, base::BindOnce(&Self::OnSignaled, weak_factory_.GetWeakPtr()),
+    base::SequencedTaskRunner::GetCurrentDefault());
+// void Self::OnSignaled(base::WaitableEvent* event) { ... }
+```
+
+**`base::CancelableEvent`** — `base/synchronization/cancelable_event.h:26`.
+A 0-1 semaphore that does not start signaled and must not be signaled twice.
+`Cancel()` is `[[nodiscard]]` and only succeeds on Windows, Linux, ChromeOS and
+Android.
+
+```cpp
+base::CancelableEvent event;
+event.Signal();
+if (event.Cancel())     // :39 — true only if no waiter consumed the signal
+  ;                     // the wake-up was withdrawn
+```
+
+**`base::ConditionVariable`** — `base/synchronization/condition_variable.h:85`.
+Takes the lock by **pointer**, and the lock must be held across `Wait()`.
+
+```cpp
+base::Lock lock_;
+base::ConditionVariable cv_{&lock_};   // :88 — Lock*, not Lock&
+// ...
+base::AutoLock auto_lock(lock_);
+while (!ready_)
+  cv_.Wait();                          // :98 — trips a restriction check (§6)
+cv_.Signal();                          // :107; Broadcast() at :105
+```
+
+**`base::MayBlock()` / `base::WithBaseSyncPrimitives()`** —
+`base/task/task_traits.h:165` / `:193`. Empty tag structs; they exist to be
+listed in a traits brace-init.
+
+```cpp
+base::ThreadPool::PostTask(
+    FROM_HERE, {base::MayBlock(), base::WithBaseSyncPrimitives()},
+    base::BindOnce(&ReadFileThenWaitForEvent));
+```
+
+**`base::ScopedAllowBlocking`** — `base/threading/thread_restrictions.h:575`.
+The API that looks right and will not compile: the constructor is private and
+every legitimate caller is written into a `friend` list starting at `:584`. New
+code cannot instantiate it without editing that list — which *is* the review
+gate the count in §6 is measuring. Outside production code, use the testing
+variant (`:716`).
+
+```cpp
+base::ScopedAllowBlockingForTesting allow_blocking;
+base::File f(path, base::File::FLAG_OPEN | base::File::FLAG_READ);
+```
+
+**`base::ScopedAllowBaseSyncPrimitives`** —
+`base/threading/thread_restrictions.h:748`. Same friend-list construction, for
+waits rather than I/O; testing variant at `:948`.
+
+```cpp
+base::ScopedAllowBaseSyncPrimitivesForTesting allow_wait;
+event.Wait();
+```
+
+**`base::ScopedBlockingCall`** — `base/threading/scoped_blocking_call.h:91`,
+`BlockingType` at `:24`. Not a permission — an *annotation*, so the pool can
+compensate by starting another worker. Adapted from the header's own
+good/bad pair (`:60`-`:90`): keep the scope tight and do no CPU work inside it,
+and do not wrap `WaitableEvent::Wait()`, which instantiates its own.
+
+```cpp
+{
+  base::ScopedBlockingCall scoped_blocking_call(
+      FROM_HERE, base::BlockingType::WILL_BLOCK);
+  ::read(fd, buf, len);
+}
+CPUIntensiveProcessing(buf);   // deliberately outside the scope
+```
+
+### Threads, when you really do need one
+
+**`base::Thread` / `base::Thread::Options`** — `base/threading/thread.h:64` /
+`:77`. A thread that owns a message loop, so it has a `task_runner()`.
+`Options` is move-only (it holds a `unique_ptr` and tracks `moved_from`,
+`:117`-`:126`), so `StartWithOptions()` (`:181`) takes it by value and you
+`std::move()` it in.
+
+```cpp
+base::Thread thread("MyThread");            // ctor :138
+base::Thread::Options options;
+options.message_pump_type = base::MessagePumpType::IO;   // :90
+options.thread_type = base::ThreadType::kUtility;        // :105
+thread.StartWithOptions(std::move(options));
+thread.task_runner()->PostTask(FROM_HERE, base::BindOnce(&Work));  // :241
+```
+
+**`base::SimpleThread` / `base::DelegateSimpleThread`** —
+`base/threading/simple_thread.h:63` / `:164`. No message loop: `Run()` returns
+and the thread ends. Nothing can be posted to it.
+
+```cpp
+class Worker : public base::SimpleThread {
+ public:
+  Worker() : base::SimpleThread("Worker") {}   // ctor :91
+  void Run() override { CrunchUntilDone(); }   // :113, pure virtual
+};
+Worker w;
+w.Start();   // :101
+w.Join();    // :105 — unless Options::joinable was set false
+```
+
+`DelegateSimpleThread` is the same thing with the body supplied by a
+`Delegate*` (`:166`) instead of by subclassing.
+
+**`base::PlatformThread`** — `base/threading/platform_thread.h:423`. Watch the
+name: it is a per-platform **alias** (`:419`-`:425`) for `PlatformThreadLinux`,
+`PlatformThreadApple` and so on, all deriving from `PlatformThreadBase`
+(`:168`) — grepping for `class PlatformThread {` finds nothing.
+
+```cpp
+base::PlatformThread::SetName("MyThread");                    // :253
+base::PlatformThreadId id = base::PlatformThread::CurrentId();  // :223
+base::PlatformThread::Sleep(base::Milliseconds(10));          // :249
+```
+
+**`base::ThreadType`** — `base/task/thread_type.h:31`. Note the header: it lives
+under `base/task/`, not `base/threading/`. The values are `kBackground`,
+`kUtility`, `kDefault`, `kPresentation`, `kAudioProcessing`, `kRealtimeAudio`.
+
+```cpp
+options.thread_type = base::ThreadType::kBackground;
+base::PlatformThread::SetDefaultThreadType(base::ThreadType::kUtility);  // :316
+```
+
+**Temporarily raising priority** — `base/threading/scoped_thread_priority.h`.
+There is no class called `ScopedThreadPriority`; the header offers
+`base::ScopedBoostPriority` (`:102`, 15 uses) and a macro for the case it was
+written for, a background thread about to page in a DLL (`:46`).
+
+```cpp
+{
+  base::ScopedBoostPriority boost(base::ThreadType::kDefault);  // :105
+  TouchContendedResource();
+}
+SCOPED_MAY_LOAD_LIBRARY_AT_BACKGROUND_PRIORITY();   // once per call site
+```
+
+### Per-thread and per-sequence storage
+
+**`base::SequenceLocalStorageSlot`** —
+`base/threading/sequence_local_storage_slot.h:228`. One value per sequence,
+destroyed with it. The slot object is normally a function-local `static`; only
+the *value* is per-sequence.
+
+```cpp
+int& GetDepth() {
+  static base::SequenceLocalStorageSlot<int> slot;
+  return slot.GetOrCreateValue();   // :80 (:170 for the small-type variant)
+}
+```
+
+The header's own example (`:28`-`:29`) writes `sls_value->GetOrCreateValue()`,
+which is wrong: `operator->` (`:104`) returns `T*`, so that spelling asks for
+`T::GetOrCreateValue`. Use `.` on the slot.
+
+**`base::ThreadLocalStorage::Slot`** —
+`base/threading/thread_local_storage.h:115`. Genuine TLS, and untyped — it
+stores `void*` and takes a destructor function.
+
+```cpp
+base::ThreadLocalStorage::Slot slot(&DestroyValue);  // :119
+slot.Set(value);                                     // :134, void*
+auto* v = static_cast<Value*>(slot.Get());           // :130
+```
+
+**`thread_local`** — the language keyword, allowed and simpler than the above.
+It is just usually the wrong scope, since a sequence's tasks migrate between
+pool threads.
+
+```cpp
+thread_local int reentrancy_depth = 0;
+```
+
+### Assertions and annotations
+
+**`SEQUENCE_CHECKER` / `DCHECK_CALLED_ON_VALID_SEQUENCE` /
+`DETACH_FROM_SEQUENCE`** — `base/sequence_checker.h:75` / `:76` / `:79`. See §3
+for the full class. All three compile to nothing outside `DCHECK` builds
+(`:82`-`:84`), so the member costs nothing in release.
+
+```cpp
+SEQUENCE_CHECKER(sequence_checker_);                  // declares the member
+DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);   // in every method
+DETACH_FROM_SEQUENCE(sequence_checker_);   // "the next caller sets the sequence"
+```
+
+**`THREAD_CHECKER`** — `base/threading/thread_checker.h:82`, with
+`DCHECK_CALLED_ON_VALID_THREAD` (`:83`) and `DETACH_FROM_THREAD` (`:86`).
+Identical shape, stricter question: same physical thread, not same sequence.
+
+```cpp
+THREAD_CHECKER(thread_checker_);
+DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+```
+
+**Detecting an unexpected second thread** —
+`base/threading/thread_collision_warner.h`. The document called this
+`THREAD_COLLISION_WARNER`; no such identifier exists. The class is
+`base::ThreadCollisionWarner` (`:146`) and the intended spelling is a pair of
+macros, which compile away outside `DCHECK` builds (`:123`-`:126`).
+
+```cpp
+class Collector {
+ private:
+  DFAKE_MUTEX(push_mutex_);        // :107 — a member, not a real lock
+  void Push(int v) {
+    DFAKE_SCOPED_LOCK(push_mutex_);  // :110 — warns if two threads are in here
+    data_.push_back(v);
+  }
+};
+```
+
+### Diagnostics
+
+**`base::HangWatcher` / `base::WatchHangsInScope`** —
+`base/threading/hang_watcher.h:106` / `:63`. You almost never touch the watcher;
+you instantiate the scope. Adapted from the header's example (`:50`); the
+default timeout is 10 s (`:70`).
+
+```cpp
+void Foobar() {
+  base::WatchHangsInScope scope(base::Seconds(5));   // ctor :73
+  DoWork();   // if this scope outlives 5s, the hang is reported
+}
+```
+
+**`base::Watchdog`** — `base/threading/watchdog.h:33`. The coarse, explicit
+version: you arm and disarm it yourself, and `Alarm()` fires if you did not get
+there in time.
+
+```cpp
+base::Watchdog watchdog(base::Seconds(30), "Startup", /*enabled=*/true);  // :46
+watchdog.Arm();      // :64
+DoStartup();
+watchdog.Disarm();   // :69
+```
+
+Override the default alarm by passing a `Watchdog::Delegate*` (`:35`) whose
+`Alarm()` (`:40`) runs on the watchdog thread.
+
+**`base::CurrentThread`** — `base/task/current_thread.h:75`. Introspection on
+the current message loop. It is a value type with a self-returning `operator->`
+(`:101`), so the `Get()->` spelling below is not a pointer dereference.
+
+```cpp
+if (base::CurrentThread::IsSet())                       // :96
+  base::CurrentThread::Get()->AddTaskObserver(this);    // :87, :136
+bool on_io = base::CurrentIOThread::IsSet();            // :306
+```
+
+### Small primitives
+
+**`base::AtomicFlag`** — `base/synchronization/atomic_flag.h:20`. One-way, and
+that is enforced: there is no `Clear()`, only `UnsafeResetForTesting()` (`:42`).
+
+```cpp
+base::AtomicFlag shutting_down_;
+shutting_down_.Set();              // :30 — from the owning sequence
+if (shutting_down_.IsSet())        // :35 — from anywhere
+  return;
+```
+
+**`base::AtomicRefCount`** — `base/atomic_ref_count.h:19`. `Decrement()` returns
+`bool`, not the new count: `true` means "still alive".
+
+```cpp
+base::AtomicRefCount refs_{1};        // :22
+refs_.Increment();                    // :27
+if (!refs_.Decrement())               // :38 — false means it hit zero
+  delete this;
+```
+
+**`base::ScopedClosureRunner`** — `base/functional/callback_helpers.h:146`.
+Guarantees a completion callback on every exit path, including early returns.
+
+```cpp
+base::ScopedClosureRunner on_exit(base::BindOnce(&NotifyDone));  // :149
+if (Failed())
+  return;             // NotifyDone() still runs
+on_exit.RunAndReset();  // :161, or Release() (:167) to hand ownership onward
+```
+
+**`base::NoDestructor`** — `base/no_destructor.h:83`. The sanctioned immutable
+global from §5: constructed once on first use, never destroyed, so no
+shutdown-order race.
+
+```cpp
+const std::map<int, std::string>& GetTable() {
+  static const base::NoDestructor<std::map<int, std::string>> table({{1, "a"}});
+  return *table;
+}
+```
+
+### Blink's cross-thread machinery
+
+**`CrossThreadBindOnce`** —
+`third_party/blink/renderer/platform/wtf/cross_thread_functional.h:94`, paired
+with `PostCrossThreadTask`
+(`third_party/blink/renderer/platform/scheduler/public/post_cross_thread_task.h:18`,
+which takes the runner by **reference**). It differs from `base::BindOnce` by
+requiring every argument to be safe to move across threads.
+
+```cpp
+PostCrossThreadTask(*task_runner, FROM_HERE,
+                    CrossThreadBindOnce(&Worker::Process, std::move(data)));
+```
+
+**`CrossThreadHandle` / `MakeCrossThreadHandle`** —
+`third_party/blink/renderer/platform/heap/cross_thread_handle.h:49` / `:55`.
+How an Oilpan `Member`-managed object survives the trip: a `Member<T>` is not a
+thread-safe handle, so a garbage-collected pointer must be wrapped. Adapted from
+the header's `PingPong` example (`:15`-`:47`).
+
+```cpp
+worker_pool::PostTask(
+    FROM_HERE, CrossThreadBindOnce(&PingPong::PongOnBackground,
+                                   MakeCrossThreadHandle(this),
+                                   std::move(task_runner_)));
+// coming back, unwrap: MakeUnwrappingCrossThreadWeakHandle(std::move(handle))
+```
+
+**`WTF::RecursiveMutex`** —
+`third_party/blink/renderer/platform/wtf/threading_primitives.h:50`. Included
+only because §10 names it; the header marks it deprecated and slated for removal
+(`:48`). Do not add uses.
+
+---
+
+## 13. What is verified here, and what is not
 
 **Measured in this checkout:** every count in this note, by grepping `*.cc` and
 `*.h` under `base/ chrome/ content/ components/ ui/
@@ -464,6 +1014,17 @@ reader-writer lock.
 configuration specifically — the annotation is Clang's and the tree enables it,
 but no failing build was produced to confirm it. The renderer's thread list in
 §4 is also simplified; compositor and worker threads vary by configuration.
+
+**Checked while writing §12:** every snippet there was written against the
+header open beside it, and each `path:line` pointer was re-grepped in this
+checkout after the section was finished; where a header already carried a usable
+example the entry says so and adapts it rather than inventing one. Three names
+this note used did not survive that pass and were corrected in §8: there is no
+`ThreadType::kDisplayCritical` (it is `kPresentation`), no class
+`ScopedThreadPriority` (only the header of that name, offering
+`base::ScopedBoostPriority`), and no `THREAD_COLLISION_WARNER` macro (the class
+is `base::ThreadCollisionWarner`, used via `DFAKE_MUTEX`). None of the snippets
+was compiled.
 
 **Named but not explored:** everything in §8 is listed with its purpose and a
 usage count, not walked through. `WaitableEventWatcher` and `CancelableEvent`
