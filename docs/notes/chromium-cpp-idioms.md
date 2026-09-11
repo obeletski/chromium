@@ -1172,6 +1172,96 @@ similarly present but rare. Note the contrast with the `[banned]` neighbours:
 coroutines and modules are not available at all, so `requires` is the one large
 C++20 feature that actually changed how this code is written.
 
+### 11.5 Returning by value: NRVO, and when `std::move` on a return is wrong
+
+Chromium returns containers and other non-trivial objects by value constantly —
+`std::vector<SummaryInput> BuildSummaryInput() const`, `std::string
+BuildPrompt(...)` — and it is worth knowing why that is not the copy it looks
+like.
+
+A function returning by value does not build the object and hand it back. The
+**caller** allocates the storage and passes its address in as a hidden
+parameter, so the signature really behaves like this:
+
+```cpp
+std::vector<SummaryInput> BuildSummaryInput() const;
+// in the ABI, roughly:
+void BuildSummaryInput(const OutlineCollector* self,
+                       std::vector<SummaryInput>* return_slot);
+```
+
+**NRVO** — named return value optimization — is the compiler noticing that a
+local is only ever used to produce the return value, and constructing it
+*directly in `return_slot`* from the start. The local and the returned object
+become one object at one address. Nothing is copied because the second object
+never exists.
+
+Two distinct rules hide behind that name, and only one of them is a guarantee:
+
+| | Form | Guaranteed? |
+|---|---|---|
+| **RVO**, C++17 guaranteed copy elision | `return Noisy();` — a prvalue | **yes**, mandatory; `-fno-elide-constructors` cannot turn it off |
+| **NRVO** | `return n;` — a named local | **no**, permitted but optional |
+
+Measured with this checkout's clang (`third_party/llvm-build`), at `-O0`, with a
+type that prints every operation:
+
+```cpp
+Noisy nrvo()            { Noisy n; return n; }            //  ctor dtor          <- elided
+Noisy rvo()             { return Noisy(); }               //  ctor dtor          <- guaranteed
+Noisy pessimized()      { Noisy n; return std::move(n); } //  ctor MOVE dtor dtor
+Noisy two_paths(bool b) { Noisy a, c; return b ? a : c; } //  ctor ctor COPY dtor x3
+```
+
+Three things follow, and the last two are the ones that catch people:
+
+* **`return std::move(n)` on a local is a pessimization.** The cast turns the
+  return expression from an id-expression naming a local into an xvalue, which
+  disqualifies it from NRVO. You force a move where you would have had nothing.
+  Clang says so directly — *"moving a local object in a return statement
+  prevents copy elision"* (`-Wpessimizing-move`), which is in `-Wall`, and this
+  build compiles with `-Wall` and `-Werror`
+  (`build/config/compiler/BUILD.gn:2119`, `:1768`). **So it is a build failure
+  here, not a style opinion.**
+* **Two possible return objects defeat NRVO**, because the compiler cannot
+  choose which to build in the slot. Worse, the fallback above is a **COPY**,
+  not a move: the implicit-move rule applies only when the operand is the
+  *name* of an automatic local, and `b ? a : c` is a conditional expression, not
+  a name.
+* **When NRVO does not fire, the cost is a move, not a copy.** Recompiling with
+  `-fno-elide-constructors` turns `nrvo()` into `ctor MOVE dtor dtor` — since
+  C++11, `return n;` first tries overload resolution treating `n` as an rvalue.
+  So the worst case for `BuildSummaryInput()` is moving a vector — three
+  pointers — never deep-copying its elements.
+
+None of this makes `return std::move(x)` rare in the tree: it appears 2,815
+times outside `third_party/`. Almost all of those are the cases NRVO never
+covered, and clang warns on neither:
+
+```cpp
+std::string Holder::take() { return std::move(member_); }   // a member, not a local
+std::unique_ptr<Base> Convert(std::unique_ptr<Derived> d) {
+  return std::move(d);                                       // different type; a conversion
+}
+```
+
+The one further case worth recognising is a **parameter**: `return std::move(p)`
+where `p` is by-value gets `-Wredundant-move` instead — parameters are already
+implicitly moved on return, but they were never NRVO candidates, so removing the
+`std::move` costs nothing and changes nothing.
+
+The conditions for NRVO, stated once: the returned entity must be a non-`volatile`
+automatic local of the same type as the return type (cv-qualification aside) —
+not a parameter, not a `static`, not a member, not a catch-clause parameter — and
+in practice the same object on every return path. `BuildSummaryInput()` satisfies
+all of them.
+
+One property that surprises people: **copy elision is the only optimization
+allowed to change observable behaviour.** The `-O0` run above skips those
+constructors' `puts` calls with no optimizer running at all. Code that depends
+on a copy constructor's side effects firing is code that breaks when the
+compiler elides.
+
 ---
 
 ## 12. Where to look before writing
