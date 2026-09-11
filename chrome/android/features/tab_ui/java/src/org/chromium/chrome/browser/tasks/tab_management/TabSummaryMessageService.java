@@ -9,14 +9,21 @@ import static org.chromium.chrome.browser.tasks.tab_management.TabListModel.Card
 import static org.chromium.chrome.browser.tasks.tab_management.TabListModel.CardProperties.ModelType.MESSAGE;
 
 import android.content.Context;
+import android.text.TextUtils;
 
 import org.chromium.build.annotations.NullMarked;
+import org.chromium.build.annotations.Nullable;
+import org.chromium.chrome.browser.tab.Tab;
+import org.chromium.chrome.browser.tabmodel.TabModel;
 import org.chromium.chrome.browser.tasks.tab_management.MessageCardView.ServiceDismissActionProvider;
 import org.chromium.chrome.browser.tasks.tab_management.MessageCardViewProperties.MessageCardScope;
 import org.chromium.chrome.browser.tasks.tab_management.TabProperties.UiType;
 import org.chromium.chrome.browser.tasks.tab_management.TabSwitcherMessageManager.MessageType;
 import org.chromium.chrome.tab_ui.R;
 import org.chromium.ui.modelutil.PropertyModel;
+import org.chromium.url.GURL;
+
+import java.util.function.Supplier;
 
 /**
  * Serves the tab summary card that sits above the tab grid in the Hub's TAB_SWITCHER pane.
@@ -45,19 +52,33 @@ import org.chromium.ui.modelutil.PropertyModel;
 @NullMarked
 public class TabSummaryMessageService
         extends MessageService<@MessageType Integer, @UiType Integer> {
-    // TODO: Replace with the model's summary once the Android side can reach it. No bug id:
-    // nothing in this checkout is filed upstream.
-    // Hardcoded rather than added to strings.xml on purpose: a new IDS_ string needs a translation
-    // screenshot that presubmit blocks on, and this text is scaffolding that will not ship. See
-    // CLAUDE.md, "Why this checkout exists".
-    private static final String PLACEHOLDER_TEXT = "Tabs summary view";
+    // How many tabs the card will name before it stops and counts the rest. A phone can easily
+    // carry dozens of tabs, and this card sits above the grid -- letting it grow without bound
+    // would push every thumbnail off screen, which is the one thing the design forbids.
+    private static final int MAX_LINES = 8;
+
+    // TODO: Replace this listing with the model's summary once the Android side can reach one.
+    // Listing the tabs is scaffolding: it proves the card can read real state and re-render,
+    // which is the part the summary will need. No bug id -- nothing here is filed upstream.
+    //
+    // All user-visible strings below are hardcoded rather than added to strings.xml: a new IDS_
+    // string needs a translation screenshot that presubmit blocks on, and none of this will ship.
+    // See CLAUDE.md, "Why this checkout exists".
+    private static final String EMPTY_TEXT = "No open tabs.";
+    private static final String UNTITLED_TEXT = "(untitled)";
 
     private final Context mContext;
+    private final Supplier<@Nullable TabModel> mTabModelSupplier;
+
+    // The model behind the card, kept so the text can be rewritten after the fact. See refresh().
+    private @Nullable PropertyModel mModel;
 
     /**
      * @param context Used only to resolve the dismiss button's content description.
+     * @param tabModelSupplier The current tab model, read each time the card is refreshed. May
+     *     supply null before the model exists, which {@link #refresh} treats as "no tabs".
      */
-    TabSummaryMessageService(Context context) {
+    TabSummaryMessageService(Context context, Supplier<@Nullable TabModel> tabModelSupplier) {
         // The existing small message-card layout and binder are reused rather than adding a new
         // view: at this stage the card is one line of text, and MessageCardView already handles
         // the dismiss button, the incognito palette and the grid's card metrics. A bespoke view
@@ -69,6 +90,7 @@ public class TabSummaryMessageService
                 R.layout.tab_grid_message_card_item,
                 MessageCardViewBinder::bind);
         mContext = context;
+        mTabModelSupplier = tabModelSupplier;
     }
 
     /**
@@ -83,6 +105,64 @@ public class TabSummaryMessageService
             ServiceDismissActionProvider<@MessageType Integer> serviceDismissActionProvider) {
         super.initialize(serviceDismissActionProvider);
         queueMessage(this::buildModel);
+    }
+
+    /**
+     * Rewrites the card's text from the current tab model.
+     *
+     * <p>This exists because of when the model is built. {@link MessageService#queueMessage} runs
+     * its factory immediately, and the only safe moment to queue is {@link #initialize}, which
+     * happens during subscription -- long before any tab is loaded into the switcher. The card's
+     * text therefore cannot be correct at construction time, and has to be written again once the
+     * tabs exist.
+     *
+     * <p>Updating {@code DESCRIPTION_TEXT} on the live model is enough to redraw: it is a writable
+     * property key, so the {@code PropertyModelChangeProcessor} calls {@code MessageCardViewBinder}
+     * for that key alone and the view updates in place. There is no need to remove and re-add the
+     * card, which would also lose its position.
+     *
+     * <p>Called from {@code TabSwitcherMessageManager#afterReset}, the point at which the grid has
+     * just been populated and the tab count is known.
+     */
+    public void refresh() {
+        if (mModel == null) return;
+        mModel.set(MessageCardViewProperties.DESCRIPTION_TEXT, buildText());
+    }
+
+    /** One line per tab: its title, or its URL when the title is empty. */
+    private String buildText() {
+        TabModel tabModel = mTabModelSupplier.get();
+        if (tabModel == null || tabModel.getCount() == 0) {
+            return EMPTY_TEXT;
+        }
+
+        int total = tabModel.getCount();
+        int shown = Math.min(total, MAX_LINES);
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; i < shown; i++) {
+            // getTabAt() is documented @Nullable; a tab can disappear between the count and the
+            // read, so skipping is the only correct response.
+            Tab tab = tabModel.getTabAt(i);
+            if (tab == null) continue;
+            if (text.length() > 0) text.append('\n');
+            text.append(lineFor(tab));
+        }
+        if (total > shown) {
+            text.append('\n').append("+ ").append(total - shown).append(" more");
+        }
+        return text.toString();
+    }
+
+    private String lineFor(Tab tab) {
+        String title = tab.getTitle();
+        if (!TextUtils.isEmpty(title)) {
+            return title;
+        }
+        // No title yet -- a tab restored from disk and not loaded has none. The URL is the next
+        // best identifier, and the spec is used rather than the host so that two tabs on the same
+        // site stay distinguishable.
+        GURL url = tab.getUrl();
+        return (url == null || url.getSpec().isEmpty()) ? UNTITLED_TEXT : url.getSpec();
     }
 
     /**
@@ -109,39 +189,57 @@ public class TabSummaryMessageService
 
     private PropertyModel buildModel(
             ServiceDismissActionProvider<@MessageType Integer> serviceDismissActionProvider) {
-        return new PropertyModel.Builder(MessageCardViewProperties.ALL_KEYS)
-                .with(MessageCardViewProperties.MESSAGE_TYPE, MessageType.TAB_SUMMARY_MESSAGE)
-                .with(
-                        MessageCardViewProperties.MESSAGE_IDENTIFIER,
-                        MessageService.DEFAULT_MESSAGE_IDENTIFIER)
-                // Without this key the binder never attaches a dismiss listener: it wires the
-                // listener inside the branch that handles the content description, so omitting the
-                // description silently leaves the button inert rather than merely unlabelled.
-                .with(
-                        MessageCardViewProperties.DISMISS_BUTTON_CONTENT_DESCRIPTION,
-                        mContext.getString(R.string.accessibility_tab_suggestion_dismiss_button))
-                .with(
-                        MessageCardViewProperties.MESSAGE_SERVICE_DISMISS_ACTION_PROVIDER,
-                        serviceDismissActionProvider)
-                .with(MessageCardViewProperties.UI_DISMISS_ACTION_PROVIDER, this::onDismissed)
-                .with(MessageCardViewProperties.DESCRIPTION_TEXT, PLACEHOLDER_TEXT)
-                // No action button: there is nothing to accept or review yet. The property has to
-                // be set explicitly -- ALL_KEYS leaves it false-by-default only because false is
-                // the boolean default, and being explicit is what documents the intent.
-                .with(MessageCardViewProperties.ACTION_BUTTON_VISIBLE, false)
-                .with(MessageCardViewProperties.IS_ICON_VISIBLE, false)
-                .with(MessageCardViewProperties.IS_INCOGNITO, false)
-                // REGULAR, not BOTH. The summary is produced from page headings sent to a remote
-                // endpoint, so it must not appear over Incognito tabs -- the same rule the desktop
-                // feature enforces with CHECK(!profile->IsOffTheRecord()). The Hub gives Incognito
-                // its own pane (INCOGNITO_TAB_SWITCHER), so this is a visible boundary here rather
-                // than a filter applied to a mixed list.
-                .with(
-                        MessageCardViewProperties
-                                .MESSAGE_CARD_VISIBILITY_CONTROL_IN_REGULAR_AND_INCOGNITO_MODE,
-                        MessageCardScope.REGULAR)
-                .with(CARD_TYPE, MESSAGE)
-                .with(CARD_ALPHA, 1f)
-                .build();
+        mModel =
+                new PropertyModel.Builder(MessageCardViewProperties.ALL_KEYS)
+                        .with(
+                                MessageCardViewProperties.MESSAGE_TYPE,
+                                MessageType.TAB_SUMMARY_MESSAGE)
+                        .with(
+                                MessageCardViewProperties.MESSAGE_IDENTIFIER,
+                                MessageService.DEFAULT_MESSAGE_IDENTIFIER)
+                        // Without this key the binder never attaches a dismiss listener: it wires
+                        // the
+                        // listener inside the branch that handles the content description, so
+                        // omitting the
+                        // description silently leaves the button inert rather than merely
+                        // unlabelled.
+                        .with(
+                                MessageCardViewProperties.DISMISS_BUTTON_CONTENT_DESCRIPTION,
+                                mContext.getString(
+                                        R.string.accessibility_tab_suggestion_dismiss_button))
+                        .with(
+                                MessageCardViewProperties.MESSAGE_SERVICE_DISMISS_ACTION_PROVIDER,
+                                serviceDismissActionProvider)
+                        .with(
+                                MessageCardViewProperties.UI_DISMISS_ACTION_PROVIDER,
+                                this::onDismissed)
+                        // Correct as of now, which is usually "no tabs"; refresh() writes the real
+                        // listing once the grid has been populated.
+                        .with(MessageCardViewProperties.DESCRIPTION_TEXT, buildText())
+                        // No action button: there is nothing to accept or review yet. The property
+                        // has to
+                        // be set explicitly -- ALL_KEYS leaves it false-by-default only because
+                        // false is
+                        // the boolean default, and being explicit is what documents the intent.
+                        .with(MessageCardViewProperties.ACTION_BUTTON_VISIBLE, false)
+                        .with(MessageCardViewProperties.IS_ICON_VISIBLE, false)
+                        .with(MessageCardViewProperties.IS_INCOGNITO, false)
+                        // REGULAR, not BOTH. The summary is produced from page headings sent to a
+                        // remote
+                        // endpoint, so it must not appear over Incognito tabs -- the same rule the
+                        // desktop
+                        // feature enforces with CHECK(!profile->IsOffTheRecord()). The Hub gives
+                        // Incognito
+                        // its own pane (INCOGNITO_TAB_SWITCHER), so this is a visible boundary here
+                        // rather
+                        // than a filter applied to a mixed list.
+                        .with(
+                                MessageCardViewProperties
+                                        .MESSAGE_CARD_VISIBILITY_CONTROL_IN_REGULAR_AND_INCOGNITO_MODE,
+                                MessageCardScope.REGULAR)
+                        .with(CARD_TYPE, MESSAGE)
+                        .with(CARD_ALPHA, 1f)
+                        .build();
+        return mModel;
     }
 }

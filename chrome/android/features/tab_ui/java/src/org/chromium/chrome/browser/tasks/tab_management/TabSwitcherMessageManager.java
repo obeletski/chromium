@@ -157,6 +157,7 @@ public class TabSwitcherMessageManager {
     private final Activity mActivity;
     private final ActivityLifecycleDispatcher mLifecycleDispatcher;
     private final NullableObservableSupplier<TabModel> mCurrentTabModelSupplier;
+    private @Nullable TabSummaryMessageService mTabSummaryMessageService;
     private final TabGridIphDialogCoordinator mTabGridIphDialogCoordinator;
     private final MultiWindowModeStateDispatcher mMultiWindowModeStateDispatcher;
     private final SnackbarManager mSnackbarManager;
@@ -350,10 +351,13 @@ public class TabSwitcherMessageManager {
                         mActivity, this::getCurrentProfile, mTabGridIphDialogCoordinator);
         mMessageCardProvider.subscribeMessageService(iphMessageService);
 
-        // The tab summary card. Subscribing is all that is required: the provider calls
-        // initialize() on the service, which queues its one message, and registers the card's
-        // layout and binder with the TabListCoordinator through MessageHostDelegateFactory.
-        mMessageCardProvider.subscribeMessageService(new TabSummaryMessageService(mActivity));
+        // The tab summary card. Subscribing is all that is required to register it: the provider
+        // calls initialize() on the service, which queues its one message, and hands the card's
+        // layout and binder to the TabListCoordinator through MessageHostDelegateFactory. The
+        // reference is kept only so afterReset() can refresh the card's text.
+        mTabSummaryMessageService =
+                new TabSummaryMessageService(mActivity, mCurrentTabModelSupplier);
+        mMessageCardProvider.subscribeMessageService(mTabSummaryMessageService);
 
         if (IncognitoReauthManager.isIncognitoReauthFeatureAvailable()
                 && mIncognitoReauthPromoMessageService == null) {
@@ -437,6 +441,12 @@ public class TabSwitcherMessageManager {
     public void afterReset(int tabCount) {
         onTabModelChanged(mCurrentTabModelSupplier.get(), null);
         onAllTabsClosed();
+        // The summary card's text is built from the tab model, which was not populated when the
+        // service queued its message. This is the first point at which the grid's contents are
+        // settled, so rewrite the card here, before it is appended below.
+        if (mTabSummaryMessageService != null) {
+            mTabSummaryMessageService.refresh();
+        }
         if (tabCount > 0) {
             appendMessagesTo(tabCount);
         }
@@ -476,10 +486,11 @@ public class TabSwitcherMessageManager {
                 mMessageCardProvider.getNextMessageItemForType(messageType);
         if (nextMessage == null || !shouldAppendMessage(nextMessage)) return;
         switch (messageType) {
-            case MessageType.PRICE_MESSAGE -> tabListCoordinator.addSpecialListItem(
-                    tabListCoordinator.getPriceWelcomeMessageInsertionIndex(),
-                    UiType.PRICE_MESSAGE,
-                    nextMessage.model);
+            case MessageType.PRICE_MESSAGE ->
+                    tabListCoordinator.addSpecialListItem(
+                            tabListCoordinator.getPriceWelcomeMessageInsertionIndex(),
+                            UiType.PRICE_MESSAGE,
+                            nextMessage.model);
             case MessageType.ARCHIVED_TABS_MESSAGE ->
                     tabListCoordinator.addSpecialListItem(
                             0, UiType.ARCHIVED_TABS_MESSAGE, nextMessage.model);

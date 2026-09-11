@@ -14,14 +14,11 @@ and it is a separate question because **none of the desktop answer transfers**.
 
 > **Status.** The surfaces and classes named below were read in this checkout.
 > The designs are proposals, with one exception: **option A now exists in
-> skeleton form.** `TabSummaryMessageService` puts a card at the top of the
-> TAB_SWITCHER pane's grid, carrying the hardcoded string "Tabs summary view".
-> Nothing behind it is real -- no model call, no headings, no JNI -- and the
-> card has been verified only as far as the build: it compiles, passes Error
-> Prone and NullAway, and its text is present in `ChromePublic.apk`'s dex. It
-> has never been seen on a screen. This machine has no `kvm` group membership
-> and every Chromium AVD is x86, while `out/Release` builds arm64, so running
-> it needs either a physical device or a separate x86_64 build.
+> skeleton form and has been run on a phone.** `TabSummaryMessageService` puts
+> a card at the top of the TAB_SWITCHER pane's grid listing the open tabs, one
+> line each. Nothing behind it is a summary yet -- no model call, no headings,
+> no JNI -- but the card renders above the thumbnails, reads live tab state and
+> dismisses, all confirmed on an arm64 device on 2026-09-11.
 
 ---
 
@@ -400,9 +397,10 @@ moving A somewhere else.
 ## Implementation of option A
 
 What was actually built, in skeleton form: a card at the top of the
-`TAB_SWITCHER` pane's grid showing the hardcoded string `"Tabs summary view"`.
-No model call, no headings, no JNI. This section is the file-by-file account and
-the mechanism it plugs into.
+`TAB_SWITCHER` pane's grid, listing the open tabs one line each. No model call,
+no headings, no JNI -- the listing is scaffolding, and its point is that it
+proves the card can read live browser state and re-render, which is the
+mechanism a real summary needs. This section is the file-by-file account.
 
 ### Files touched
 
@@ -534,7 +532,7 @@ sequenceDiagram
     TLC->>TLM: addSpecialItemToModel(0, uiType, model)
     TLM->>MODEL: add(0, ListItem(uiType, model))
     MODEL->>VIEW: adapter inflates the layout,<br/>binder applies the model
-    Note over VIEW: shows "Tabs summary view"<br/>spanning the full grid width
+    Note over VIEW: lists the open tabs<br/>spanning the full grid width
 ```
 
 Two details in that flow are worth stating outright:
@@ -644,24 +642,50 @@ As a list item, all three problems are somebody else's already-solved code.
   `tab_grid_message_card_item` already supplies the dismiss button, the
   incognito palette and the grid's card metrics. A bespoke view earns its place
   when the card grows the shimmer and the footer.
+* **The text is rewritten, not rebuilt.** `queueMessage()` runs its factory
+  immediately and the only safe moment to queue is `initialize()`, during
+  subscription — long before a tab is loaded into the switcher. So the card's
+  text cannot be right at construction. `refresh()`
+  ([`TabSummaryMessageService.java`](https://github.com/obeletski/chromium/blob/floating-window/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/TabSummaryMessageService.java)) sets
+  `DESCRIPTION_TEXT` on the live model instead, which redraws the view in place
+  through the change processor and keeps the card's position; removing and
+  re-adding it would lose that. It is called from `afterReset()`, the first
+  point at which the grid's contents are settled.
+* **The listing refreshes only on reset.** Opening or closing a tab while the
+  switcher is already on screen does not update the card until the pane is left
+  and re-entered. Making it live needs a `TabModelObserver`.
+* **Eight lines, then `+ N more`.** The card sits *above* the grid, so letting
+  it grow with the tab count would push every thumbnail off screen — the one
+  behaviour the design forbids.
 * **No feature flag.** The card appears in every build of this checkout. Gating
   it means `ChromeFeatureList.java` plus the C++ registration, and is the first
   thing to add if this goes any further.
 
 ### What is verified, and what is not
 
-Verified: compiles into `chrome_java`; passes Error Prone and NullAway (the new
-file is `@NullMarked`); the string `"Tabs summary view"` is present in
-`ChromePublic.apk`'s `classes.dex` and `classes2.dex`.
+Observed on an arm64 phone, 2026-09-11, running a `chrome_public_apk` build of
+this branch:
 
-**Not verified: anything visual.** The card has never been rendered. This
-machine is not in the `kvm` group and `sudo` needs a password, every Chromium
-AVD proto is x86 while `out/Release` builds `arm64`, and no device is attached.
-Running it needs a physical device or a separate x86_64 build.
+* the card renders, **above the first row of thumbnails** — which is the one
+  claim the design had to earn, and the reason `addSpecialListItem()` is called
+  with index 0 rather than `getTabListModelSize()`;
+* it lists the open tabs, so it is reading live `TabModel` state through
+  `refresh()` rather than showing anything baked in at build time;
+* the dismiss button removes it and it stays removed.
 
-Also unexercised, and worth knowing before trusting any of the above: the
-dismiss path, the Incognito scope check, and the behaviour when all tabs are
-closed — `onAllTabsClosed()`
+That last point is worth dwelling on, because the failure came first. The build
+installed before the fix showed exactly the defect predicted from reading the
+source: *"the cross is there but I cannot close it."* One tap removed the card
+and `dismissHandler()`'s re-append put it straight back, with nothing in the
+logs. The trap described above was written as a hypothetical and is now a
+measurement.
+
+Also verified, mechanically: compiles into `chrome_java`; passes Error Prone and
+NullAway (the new file is `@NullMarked`).
+
+**Not verified.** The Incognito scope check has not been exercised — the card
+should be absent from the Incognito pane, and nobody has looked. Nor has the
+behaviour when all tabs are closed — `onAllTabsClosed()`
 ([`TabSwitcherMessageManager.java:586`](https://github.com/obeletski/chromium/blob/floating-window/chrome/android/features/tab_ui/java/src/org/chromium/chrome/browser/tasks/tab_management/TabSwitcherMessageManager.java#L586))
 removes the IPH, price and Incognito-reauth cards explicitly and does **not**
 mention this one, so an empty grid may keep a summary card describing nothing.
