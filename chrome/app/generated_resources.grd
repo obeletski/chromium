@@ -9734,6 +9734,11 @@ Keep your key file in a safe place. You will need it to create new versions of y
         In other folders
       </message>
 
+      <!-- AI side panel strings -->
+      <message name="IDS_SHOW_AI_SIDE_PANEL" desc="App menu entry point to open the AI side panel next to the current tab.">
+        AI side panel
+      </message>
+
       <!-- Reading mode strings -->
       <message name="IDS_SHOW_READING_MODE_SIDE_PANEL" desc="Context menu entry point to open the reading mode feature in the side panel.">
         Reading mode

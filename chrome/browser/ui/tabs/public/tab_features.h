@@ -34,6 +34,7 @@
 #include "chrome/common/buildflags.h"
 #include "ui/base/unowned_user_data/user_data_factory.h"
 
+class AiSidePanelCoordinator;
 class AskBeforeHttpDialogController;
 class BookmarkBarPreloadPipelineManager;
 class BookmarkPageActionController;
@@ -556,6 +557,7 @@ class TabFeatures {
   std::unique_ptr<glic::GlicTabIndicatorHelper> glic_tab_indicator_helper_;
   std::unique_ptr<glic::GlicSidePanelCoordinator> glic_side_panel_coordinator_;
   std::unique_ptr<geic::GeicSidePanelCoordinator> geic_side_panel_coordinator_;
+  std::unique_ptr<AiSidePanelCoordinator> ai_side_panel_coordinator_;
   std::unique_ptr<glic::GlicSelectionObserver> glic_selection_observer_;
   std::unique_ptr<glic::SelectionOverlayController>
       glic_selection_overlay_controller_;

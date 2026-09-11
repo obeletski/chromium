@@ -576,4 +576,6 @@ BASE_FEATURE(kOSCryptAsyncAvailabilityInfoBar,
 BASE_FEATURE(kDeferLayoutDuringBrowserStartup,
              base::FEATURE_DISABLED_BY_DEFAULT);
 
+BASE_FEATURE(kAiSidePanel, base::FEATURE_DISABLED_BY_DEFAULT);
+
 }  // namespace features

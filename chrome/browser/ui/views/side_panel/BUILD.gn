@@ -9,6 +9,10 @@ import("//extensions/buildflags/buildflags.gni")
 
 source_set("side_panel") {
   sources = [
+    "ai/ai_side_panel_coordinator.cc",
+    "ai/ai_side_panel_coordinator.h",
+    "ai/ai_side_panel_view.cc",
+    "ai/ai_side_panel_view.h",
     "bookmarks/bookmarks_side_panel_coordinator.cc",
     "bookmarks/bookmarks_side_panel_coordinator.h",
     "comments/comments_side_panel_coordinator.cc",

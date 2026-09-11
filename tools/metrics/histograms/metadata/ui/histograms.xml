@@ -1630,6 +1630,7 @@ features through Chrome Labs. -->
     <variant name=".SetBrowserAsDefault"/>
     <variant name=".Settings"/>
     <variant name=".ShowAddresses"/>
+    <variant name=".ShowAiSidePanel"/>
     <variant name=".ShowBookmarkBar"/>
     <variant name=".ShowBookmarkMgr"/>
     <variant name=".ShowBookmarkSidePanel"/>

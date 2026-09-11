@@ -90,6 +90,7 @@
 #include "chrome/browser/ui/toolbar/chrome_labs/chrome_labs_utils.h"
 #include "chrome/browser/ui/ui_features.h"
 #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+#include "chrome/browser/ui/views/side_panel/ai/ai_side_panel_coordinator.h"
 #include "chrome/browser/ui/web_applications/web_app_dialog_utils.h"
 #include "chrome/browser/ui/web_applications/web_app_launch_utils.h"
 #include "chrome/browser/ui/web_applications/web_app_ui_utils.h"
@@ -1103,6 +1104,13 @@ void ToolsMenuModel::Build(BrowserWindowInterface* browser) {
       GetIndexOfCommandId(IDC_SHOW_READING_MODE_SIDE_PANEL).value(),
       kReadingModeMenuItem);
 
+  if (AiSidePanelCoordinator::IsSupported(browser->GetProfile())) {
+    AddItemWithStringIdAndVectorIcon(
+        this, IDC_SHOW_AI_SIDE_PANEL, IDS_SHOW_AI_SIDE_PANEL,
+        features::IsRoundedIconsEnabled() ? kDraftSparkIcon
+                                          : kDraftSparkOldIcon);
+  }
+
   AddSeparator(ui::NORMAL_SEPARATOR);
 
   AddItemWithStringIdAndVectorIcon(
@@ -1262,7 +1270,8 @@ void AppMenuModel::ExecuteCommand(int command_id, int event_flags) {
     case IDC_SHOW_HISTORY_CLUSTERS_SIDE_PANEL:
     case IDC_SHOW_READING_MODE_SIDE_PANEL:
     case IDC_READING_LIST_MENU_SHOW_UI:
-    case IDC_SHOW_CUSTOMIZE_CHROME_SIDE_PANEL: {
+    case IDC_SHOW_CUSTOMIZE_CHROME_SIDE_PANEL:
+    case IDC_SHOW_AI_SIDE_PANEL: {
       actions::ActionInvocationContext context =
           actions::ActionInvocationContext::Builder()
               .SetProperty(
@@ -1611,6 +1620,13 @@ void AppMenuModel::LogMenuMetrics(int command_id) {
             "WrenchMenu.TimeToAction.ShowHistoryClustersSidePanel", delta);
       }
       LogMenuAction(MENU_ACTION_SHOW_HISTORY_CLUSTER_SIDE_PANEL);
+      break;
+    case IDC_SHOW_AI_SIDE_PANEL:
+      if (!uma_action_recorded_) {
+        base::UmaHistogramMediumTimes("WrenchMenu.TimeToAction.ShowAiSidePanel",
+                                      delta);
+      }
+      LogMenuAction(MENU_ACTION_SHOW_AI_SIDE_PANEL);
       break;
     case IDC_SHOW_READING_MODE_SIDE_PANEL:
       if (!uma_action_recorded_) {

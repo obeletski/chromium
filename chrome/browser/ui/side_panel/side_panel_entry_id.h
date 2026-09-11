@@ -43,6 +43,7 @@
   V(kGlic, kActionSidePanelShowGlic, "Glic")                                  \
   V(kTabsFromOtherDevices, kActionSidePanelShowTabsFromOtherDevices,          \
     "TabsFromOtherDevices")                                                   \
+  V(kAiSidePanel, kActionSidePanelShowAiSidePanel, "AiSidePanel")             \
   V(kSidePanelDev, std::nullopt, "SidePanelDev")                              \
   V(kTestTabScopedEntry, std::nullopt, "TestTabScopedEntry")                  \
   /* Extensions (nothing more should be added below here) */                  \

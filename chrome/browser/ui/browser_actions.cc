@@ -161,6 +161,7 @@
 #include "chrome/browser/ui/views/media_router/cast_browser_controller.h"
 #include "chrome/browser/ui/views/page_info/page_info_view_factory.h"
 #include "chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_toolbar_bubble_controller.h"
+#include "chrome/browser/ui/views/side_panel/ai/ai_side_panel_coordinator.h"
 #include "chrome/browser/ui/views/side_panel/comments/comments_side_panel_coordinator.h"
 #include "chrome/browser/ui/views/side_panel/history/history_side_panel_coordinator.h"
 #include "chrome/browser/ui/views/side_panel/history_clusters/history_clusters_side_panel_utils.h"
@@ -660,6 +661,17 @@ void BrowserActions::InitializeSidePanelActions() {
                     actions::ActionPinnableState::kPinnable))
             .SetVisible(contextual_tasks::EntryPointEligibilityManager::
                             IsPinningEligible(profile))
+            .Build());
+  }
+
+  if (AiSidePanelCoordinator::IsSupported(profile)) {
+    root_action_item_->AddChild(
+        SidePanelAction(SidePanelEntryId::kAiSidePanel, IDS_SHOW_AI_SIDE_PANEL,
+                        IDS_SHOW_AI_SIDE_PANEL,
+                        features::IsRoundedIconsEnabled() ? kDraftSparkIcon
+                                                          : kDraftSparkOldIcon,
+                        kActionSidePanelShowAiSidePanel, bwi,
+                        /*is_pinnable=*/true)
             .Build());
   }
 

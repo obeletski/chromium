@@ -117,6 +117,7 @@
 #include "chrome/browser/ui/views/location_bar/cookie_controls/cookie_controls_page_action_controller.h"
 #include "chrome/browser/ui/views/location_bar/lens_overlay_homework_page_action_controller.h"
 #include "chrome/browser/ui/views/passwords/manage_passwords_page_action_controller.h"
+#include "chrome/browser/ui/views/side_panel/ai/ai_side_panel_coordinator.h"
 #include "chrome/browser/ui/views/side_panel/customize_chrome/side_panel_controller_views.h"
 #include "chrome/browser/ui/views/translate/translate_page_action_controller.h"
 #include "chrome/browser/ui/views/zoom/zoom_view_controller.h"
@@ -429,6 +430,12 @@ void TabFeatures::Init(TabInterface& tab, Profile* profile) {
     if (geic::IsGeicEnabled(profile)) {
       geic_side_panel_coordinator_ =
           GetUserDataFactory().CreateInstance<geic::GeicSidePanelCoordinator>(
+              tab, tab, side_panel_registry_.get());
+    }
+
+    if (AiSidePanelCoordinator::IsSupported(profile)) {
+      ai_side_panel_coordinator_ =
+          GetUserDataFactory().CreateInstance<AiSidePanelCoordinator>(
               tab, tab, side_panel_registry_.get());
     }
     // TODO(crbug.com/433973411): Move this logic to a helper function.

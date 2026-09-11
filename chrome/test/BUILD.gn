@@ -2776,6 +2776,7 @@ if (!is_android) {
       "../browser/ui/views/sharing/remote_copy_browsertest.cc",
       "../browser/ui/views/sharing/sharing_browsertest.cc",
       "../browser/ui/views/sharing/sharing_browsertest.h",
+      "../browser/ui/views/side_panel/ai/ai_side_panel_coordinator_browsertest.cc",
       "../browser/ui/views/side_panel/history_clusters/history_clusters_side_panel_coordinator_browsertest.cc",
       "../browser/ui/views/side_panel/side_panel_coordinator_browsertest.cc",
       "../browser/ui/views/side_panel/side_panel_web_ui_view_browsertest.cc",

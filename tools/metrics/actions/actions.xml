@@ -62,6 +62,8 @@ should be able to be added at any place in this file.
   <variant name=".kActionShowPaymentsBubbleOrPage"
       summary="Show payments bubble or page action"/>
   <variant name=".kActionShowTranslate" summary="Show translate action"/>
+  <variant name=".kActionSidePanelShowAiSidePanel"
+      summary="Show AI side panel action"/>
   <variant name=".kActionSidePanelShowBookmarks"
       summary="Show bookmarks side panel action"/>
   <variant name=".kActionSidePanelShowContextualTasks"

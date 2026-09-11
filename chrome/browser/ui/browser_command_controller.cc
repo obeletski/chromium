@@ -92,6 +92,7 @@
 #include "chrome/browser/ui/toolbar/chrome_labs/chrome_labs_utils.h"
 #include "chrome/browser/ui/ui_features.h"
 #include "chrome/browser/ui/views/frame/browser_view.h"
+#include "chrome/browser/ui/views/side_panel/ai/ai_side_panel_coordinator.h"
 #include "chrome/browser/ui/views/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_coordinator.h"
 #include "chrome/browser/ui/web_applications/app_browser_controller.h"
 #include "chrome/browser/ui/web_applications/web_app_dialog_utils.h"
@@ -1275,6 +1276,10 @@ void BrowserCommandController::HandleCommandWithDisposition(
       SidePanelUI::From(browser_)->Show(SidePanelEntryId::kComments,
                                         SidePanelOpenTrigger::kAppMenu);
       break;
+    case IDC_SHOW_AI_SIDE_PANEL:
+      SidePanelUI::From(browser_)->Show(SidePanelEntryId::kAiSidePanel,
+                                        SidePanelOpenTrigger::kAppMenu);
+      break;
     case IDC_MANAGE_EXTENSIONS:
     case IDC_SAFETY_HUB_MANAGE_EXTENSIONS:
       ShowExtensions(webui::GetBrowserForOpeningWebUi(browser_));
@@ -1863,6 +1868,8 @@ void BrowserCommandController::InitCommandState() {
       TabsFromOtherDevicesSidePanelCoordinator::IsSupported(profile()));
   command_updater_->UpdateCommandEnabled(IDC_SHOW_DOWNLOADS, true);
   command_updater_->UpdateCommandEnabled(IDC_SHOW_COMMENTS_SIDE_PANEL, true);
+  command_updater_->UpdateCommandEnabled(
+      IDC_SHOW_AI_SIDE_PANEL, AiSidePanelCoordinator::IsSupported(profile()));
   command_updater_->UpdateCommandEnabled(IDC_FIND_AND_EDIT_MENU, true);
   command_updater_->UpdateCommandEnabled(IDC_SAVE_AND_SHARE_MENU, true);
   command_updater_->UpdateCommandEnabled(IDC_SHOW_READING_MODE_SIDE_PANEL,
