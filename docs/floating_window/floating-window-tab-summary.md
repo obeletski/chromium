@@ -1100,6 +1100,43 @@ cold-start failure in §13 and the silent failure shapes.
   ([`explain_selection_trigger.cc:201`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/glic/selection/explain_selection_trigger.cc#L201)).
   Defensible for a flag-gated demo, and a blocker for anything shipping.
 
+### TODO: log `NetError()` and `finishReason` before anything else
+
+**This is the next change to make, and it blocks the one everybody reaches for
+first.**
+
+Two of the defects above, and the cold-start failure in §13, are all the same
+problem wearing different clothes: `OnResponse()` decides a request failed
+without ever recording *why*. One `LOG(WARNING)` line covers offline, DNS, TLS,
+the 8-second timeout, `ERR_NETWORK_CHANGED` and an empty 5xx-after-retry; a
+second failure shape prints nothing at all.
+
+```cpp
+// In OnResponse(), the no-body branch (:275) -- currently one message for
+// six different network failures:
+LOG(WARNING) << "Floating window summary: no response body, net error "
+             << net::ErrorToString(url_loader_->NetError());
+
+// And where a well-formed reply yields no usable text (:294 onwards),
+// before running the callback with nullopt:
+const std::string* finish_reason =
+    (*candidates)[0].GetDict().FindString("finishReason");
+LOG(WARNING) << "Floating window summary: no usable text, finishReason "
+             << (finish_reason ? *finish_reason : "absent");
+```
+
+`NetError()` is [`simple_url_loader.h:445`](https://github.com/obeletski/chromium/blob/floating-window/services/network/public/cpp/simple_url_loader.h#L445);
+it is valid inside the completion callback.
+
+**Why this comes first.** The obvious fix for the cold-start bug is to widen
+`SetRetryOptions()` ([`:257`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_summarizer.cc#L257)) beyond `RETRY_ON_5XX`, and there are two
+candidates — `RETRY_ON_NAME_NOT_RESOLVED` and `RETRY_ON_NETWORK_CHANGE`
+([`simple_url_loader.h:99`](https://github.com/obeletski/chromium/blob/floating-window/services/network/public/cpp/simple_url_loader.h#L99)).
+Neither can be chosen on the evidence available, because the evidence does not
+name the error. Adding a flag now means shipping a retry that may never fire,
+with no way to tell whether it worked. Log first, reproduce once, read the code,
+*then* pick the flag.
+
 ### Deliberate, but still limitations
 
 * **No caching.** Every window opening mints a token and issues a request, so
