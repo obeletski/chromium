@@ -244,7 +244,25 @@ go out. Chromium uses Gerrit via `git cl`, not GitHub PRs.
 
 - Each feature gets its own branch, cut from the upstream commit below any other
   in-flight work — not stacked on another feature's branch.
-- Never commit submodules: `git -c diff.ignoreSubmodules=all commit -a`.
+- **Stage explicit paths. Never `git add -A`, `git add .`, or `commit -a`.**
+  More than one Claude session can be running in this same working tree at once
+  — they share the checkout and the index but see nothing of each other's edits.
+  A blanket stage silently sweeps up another session's in-flight work and
+  commits it under your message. Name the files:
+  `git add <path>…` then `git -c diff.ignoreSubmodules=all commit`.
+  Run `git status` before committing and confirm every listed path is yours.
+- Never commit submodules — keep the flag even when staging by hand:
+  `git -c diff.ignoreSubmodules=all commit`. (The `-a` form that used to be
+  recommended here is what the rule above now forbids.)
+- **Never `git checkout <other-branch>` without checking first.** One working
+  tree means a branch switch yanks the tree out from under any other session
+  mid-edit, and on this checkout it also invalidates the build. To commit to a
+  branch that is not checked out, build the tree with a temporary index
+  (`GIT_INDEX_FILE=… git read-tree` → `git update-index` → `git commit-tree` →
+  `git update-ref`) rather than switching.
+- Do not run two builds against the same `out/` dir at once; siso keeps state
+  there (`.siso_fs_state`, `.siso_deps`, `.ninja_log`) and concurrent runs
+  contend over it.
 - `git cl format` is still worth running before every commit; so is any
   presubmit script that guards a file you touched (e.g.
   `tools/metrics/histograms/pretty_print.py --presubmit <file>`).
