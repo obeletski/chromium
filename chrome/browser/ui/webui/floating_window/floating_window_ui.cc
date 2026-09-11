@@ -18,19 +18,23 @@
 #include "base/strings/strcat.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
+#include "base/strings/stringprintf.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/time/time.h"
 #include "base/timer/timer.h"
+#include "base/unguessable_token.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/ui/browser_window/public/browser_collection.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
 #include "chrome/browser/ui/tabs/tab_strip_model.h"
+#include "chrome/browser/ui/webui/floating_window/floating_window_summarizer.h"
 #include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/web_contents.h"
 #include "content/public/browser/web_ui.h"
 #include "content/public/browser/web_ui_data_source.h"
 #include "mojo/public/cpp/bindings/callback_helpers.h"
+#include "services/network/public/mojom/content_security_policy.mojom.h"
 #include "ui/accessibility/ax_enums.mojom.h"
 #include "ui/accessibility/ax_mode.h"
 #include "ui/accessibility/ax_node_data.h"
@@ -188,12 +192,70 @@ constexpr char kPageHead[] = R"(<!doctype html>
       color: color-mix(in srgb, canvastext 55%, canvas);
       margin: 0;
     }
+    /* The summary frame. A fixed height is not a stylistic choice: an iframe
+       cannot resize its parent without script, and this page has none, so the
+       frame has to reserve its space up front and scroll if the summary runs
+       long. It is sized for the two or three sentences the prompt asks for. */
+    .summary {
+      background: color-mix(in srgb, canvastext 4%, canvas);
+      border: 1px solid color-mix(in srgb, canvastext 15%, canvas);
+      border-radius: 4px;
+      display: block;
+      height: 76px;
+      margin-top: 14px;
+      overflow: auto;
+      padding: 0;
+      width: 100%;
+    }
   </style>
 </head>
 <body>
 )";
 
 constexpr char kPageTail[] = R"(</body>
+</html>
+)";
+
+// The summary lives in its own document, framed by the main one.
+//
+// The point of the iframe is latency. A summary needs a model round trip of a
+// second or more, and the tab list does not -- so rather than making the whole
+// page wait (which is what folding the request into OutlineCollector would
+// mean), the tab list is served at once and the summary is served separately,
+// by a second request whose GotDataCallback is simply held until the model
+// answers. Both are still HTML composed in C++, both are still script-free, and
+// the user still sees one navigation.
+//
+// The height is fixed because an iframe cannot resize its parent without
+// script, and script is exactly what this page does not have. `overflow:auto`
+// makes an over-long summary scroll rather than clip.
+constexpr char kSummaryFrameFormat[] = R"(<iframe class="summary" src="%s"
+  title="Summary of open tabs" sandbox="allow-same-origin"></iframe>
+)";
+
+// The framed document. Minimal by design: it inherits nothing from the parent,
+// so it carries its own colours, and it is the only place model-authored text
+// is rendered.
+constexpr char kSummaryDocHead[] = R"(<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: canvas;
+      color: canvastext;
+      color-scheme: light dark;
+      font: 13px system-ui, sans-serif;
+    }
+    p { margin: 0; }
+    .muted { color: color-mix(in srgb, canvastext 55%, canvas); font-style: italic; }
+  </style>
+</head>
+<body>
+)";
+
+constexpr char kSummaryDocTail[] = R"(</body>
 </html>
 )";
 
@@ -365,8 +427,10 @@ std::string BuildOutlineRowsHtml(const TabEntry& tab) {
   return html;
 }
 
-// Renders the whole document body from the gathered entries.
-std::string BuildPageBodyHtml(const std::vector<TabEntry>& tabs) {
+// Renders the whole document body from the gathered entries. `summary_frame` is
+// the <iframe> element for the summary, or empty when the summary is off.
+std::string BuildPageBodyHtml(const std::vector<TabEntry>& tabs,
+                              const std::string& summary_frame) {
   if (tabs.empty()) {
     return "<p class=\"empty\">No open tabs.</p>\n";
   }
@@ -412,7 +476,109 @@ std::string BuildPageBodyHtml(const std::vector<TabEntry>& tabs) {
        window_count == 1 ? " window" : " windows",
        "</span></h1>\n<table><thead><tr><th class=\"idx\">#</th><th>Title</th>"
        "<th>URL</th></tr></thead>\n",
-       rows, "</table>\n"});
+       rows, "</table>\n",
+       // After the table, per the requirement. Empty when the summary is off,
+       // so a build without a key renders exactly what it did before.
+       summary_frame});
+}
+
+// Holds a summary that is being fetched, so the two requests can find it.
+//
+// The problem this solves: the tab list and the summary arrive as *two*
+// navigations, each with its own GotDataCallback. The first request starts the
+// model call; the second, moments later, has to attach to it. Something has to
+// outlive both, and it cannot be the data source -- the subframe navigation
+// constructs a second FloatingWindowUI, whose CreateAndAdd() *replaces* the
+// source. In-flight loads survive that (they hold a scoped_refptr to it), but
+// anything stored on the source would be lost.
+//
+// So it lives on the BrowserContext, which is a base::SupportsUserData and
+// outlives every navigation in the profile. The token in the iframe URL is a
+// correlation id rather than a capability: both requests are same-origin from
+// the same profile, and it exists so that two windows opened in quick
+// succession do not collide.
+class SummaryRegistry : public base::SupportsUserData::Data {
+ public:
+  static constexpr char kUserDataKey[] = "FloatingWindowSummaryRegistry";
+
+  struct Entry {
+    Entry();
+    ~Entry();
+    Entry(Entry&&);
+    Entry& operator=(Entry&&);
+
+    std::unique_ptr<floating_window::FloatingWindowSummarizer> summarizer;
+
+    // Whether the model has answered *at all*. This is deliberately separate
+    // from `summary` having a value: nullopt is a legitimate answer meaning
+    // "the request failed", and conflating the two made a failed request park
+    // the frame forever, waiting for a reply that had already come. Two
+    // questions, two fields.
+    bool answered = false;
+    std::optional<std::string> summary;
+
+    // Set if the frame asked before the model answered.
+    content::WebUIDataSource::GotDataCallback waiting;
+  };
+
+  static SummaryRegistry& GetOrCreate(Profile* profile) {
+    auto* existing =
+        static_cast<SummaryRegistry*>(profile->GetUserData(kUserDataKey));
+    if (!existing) {
+      auto owned = std::make_unique<SummaryRegistry>();
+      existing = owned.get();
+      profile->SetUserData(kUserDataKey, std::move(owned));
+    }
+    return *existing;
+  }
+
+  SummaryRegistry() = default;
+  ~SummaryRegistry() override = default;
+
+  Entry& Create(const std::string& token) {
+    // Bound the map. Each window press mints a token, and a user who toggles
+    // the window repeatedly would otherwise accumulate entries for summaries
+    // nobody will ever read.
+    if (entries_.size() >= kMaxEntries) {
+      entries_.clear();
+    }
+    return entries_[token];
+  }
+
+  Entry* Find(const std::string& token) {
+    auto it = entries_.find(token);
+    return it == entries_.end() ? nullptr : &it->second;
+  }
+
+  void Erase(const std::string& token) { entries_.erase(token); }
+
+ private:
+  static constexpr size_t kMaxEntries = 8;
+  std::map<std::string, Entry> entries_;
+};
+
+SummaryRegistry::Entry::Entry() = default;
+SummaryRegistry::Entry::~Entry() = default;
+SummaryRegistry::Entry::Entry(Entry&&) = default;
+SummaryRegistry::Entry& SummaryRegistry::Entry::operator=(Entry&&) = default;
+
+// Renders the summary document served into the iframe.
+//
+// The model's output is untrusted text rendered into a chrome:// document, so
+// it goes through Escaped() exactly like a page title does. It is inserted as
+// text, never as markup: the prompt asks for plain text precisely so that
+// rendering it verbatim is both safe and legible.
+std::string BuildSummaryDocument(const std::optional<std::string>& summary) {
+  std::string body;
+  // std::nullopt is failure -- no key, no network, an API error. An empty
+  // string would mean the model answered with nothing, which it should not do;
+  // both render as unavailable rather than as a confident blank.
+  if (!summary.has_value() || summary->empty()) {
+    body = "<p class=\"muted\">Summary unavailable.</p>\n";
+  } else {
+    base::StrAppend(&body, {"<p>", Escaped(*summary), "</p>\n"});
+  }
+  return base::StrCat({kSummaryDocHead, body, kSummaryDocTail});
 }
 
 // Owns the in-flight gather and produces the response when it settles.
@@ -433,6 +599,33 @@ class OutlineCollector : public base::RefCounted<OutlineCollector> {
                    content::WebUIDataSource::GotDataCallback callback)
       : tabs_(std::move(tabs)), callback_(std::move(callback)) {}
 
+  // The <iframe> element to place after the table, or empty for no summary.
+  // Set before the snapshots settle; the collector never inspects it.
+  void set_summary_frame(std::string frame) {
+    summary_frame_ = std::move(frame);
+  }
+
+  // Read once the snapshots have settled, to build the model's prompt. Returns
+  // only http(s) tabs: the tab list also contains chrome://settings,
+  // devtools:// and file:// tabs, whose headings ("Passwords", "Payment
+  // methods") must not leave the machine.
+  std::vector<floating_window::SummaryInput> BuildSummaryInput() const {
+    std::vector<floating_window::SummaryInput> input;
+    for (const TabEntry& tab : tabs_) {
+      const GURL url(tab.url);
+      if (!url.SchemeIsHTTPOrHTTPS()) {
+        continue;
+      }
+      floating_window::SummaryInput entry;
+      entry.title = base::UTF16ToUTF8(tab.title);
+      for (const Heading& heading : tab.outline) {
+        entry.headings.push_back(heading.text);
+      }
+      input.push_back(std::move(entry));
+    }
+    return input;
+  }
+
   OutlineCollector(const OutlineCollector&) = delete;
   OutlineCollector& operator=(const OutlineCollector&) = delete;
 
@@ -452,6 +645,14 @@ class OutlineCollector : public base::RefCounted<OutlineCollector> {
     tabs_[index].snapshot_returned = true;
     tabs_[index].outline = ExtractOutline(update);
     ResolveOne();
+  }
+
+  // Called just before the page is published, with the headings complete. This
+  // is the earliest moment the prompt can be built, and deliberately the last
+  // thing that happens before the tab list goes out -- the model call must not
+  // delay it.
+  void set_on_finished(base::OnceCallback<void(const OutlineCollector&)> cb) {
+    on_finished_ = std::move(cb);
   }
 
   void StartDeadline() {
@@ -476,15 +677,21 @@ class OutlineCollector : public base::RefCounted<OutlineCollector> {
     }
     finished_ = true;
     deadline_.Stop();
-    std::move(callback_).Run(base::MakeRefCounted<base::RefCountedString>(
-        base::StrCat({kPageHead, BuildPageBodyHtml(tabs_), kPageTail})));
+    if (on_finished_) {
+      std::move(on_finished_).Run(*this);
+    }
+    std::move(callback_).Run(
+        base::MakeRefCounted<base::RefCountedString>(base::StrCat(
+            {kPageHead, BuildPageBodyHtml(tabs_, summary_frame_), kPageTail})));
   }
 
   std::vector<TabEntry> tabs_;
+  std::string summary_frame_;
   content::WebUIDataSource::GotDataCallback callback_;
   size_t pending_ = 0;
   bool finished_ = false;
   base::OneShotTimer deadline_;
+  base::OnceCallback<void(const OutlineCollector&)> on_finished_;
 };
 
 // First half of SetRequestFilter(): decides whether this source wants to answer
@@ -509,9 +716,75 @@ bool ShouldHandleRequest(const std::string& /*path*/) {
 // the data source is owned by the URLDataManager keyed on that same
 // BrowserContext, so the source is torn down with the profile and this callback
 // cannot outlive it.
+// Runs when the model answers. Either the frame is already waiting -- in which
+// case its parked callback runs now -- or the frame has not asked yet and the
+// answer is stored for it to collect.
+void OnSummaryReady(Profile* profile,
+                    const std::string& token,
+                    std::optional<std::string> summary) {
+  SummaryRegistry& registry = SummaryRegistry::GetOrCreate(profile);
+  SummaryRegistry::Entry* entry = registry.Find(token);
+  if (!entry) {
+    return;  // The window was closed, or the entry was evicted.
+  }
+
+  entry->answered = true;
+  entry->summary = std::move(summary);
+  if (entry->waiting) {
+    std::move(entry->waiting)
+        .Run(base::MakeRefCounted<base::RefCountedString>(
+            BuildSummaryDocument(entry->summary)));
+    registry.Erase(token);
+  }
+  // Otherwise the frame has not navigated yet; HandleSummaryRequest() will find
+  // the stored answer and serve it immediately.
+}
+
+// Serves the framed summary document for "summary?token=...".
+//
+// Three outcomes, and the middle one is the reason the iframe exists: if the
+// model has not answered yet, this callback is *parked* on the registry entry
+// and run later. The frame stays blank meanwhile, and the tab list -- already
+// on screen -- is unaffected.
+void HandleSummaryRequest(Profile* profile,
+                          const std::string& path,
+                          content::WebUIDataSource::GotDataCallback callback) {
+  const size_t query = path.find('?');
+  const std::string token =
+      query == std::string::npos ? std::string() : path.substr(query + 1);
+
+  SummaryRegistry::Entry* entry =
+      SummaryRegistry::GetOrCreate(profile).Find(token);
+  if (!entry) {
+    // No such request in flight: a stale frame from a previous window, or a
+    // hand-typed URL. Render the same "unavailable" the timeout renders.
+    std::move(callback).Run(base::MakeRefCounted<base::RefCountedString>(
+        BuildSummaryDocument(std::nullopt)));
+    return;
+  }
+
+  if (entry->answered) {
+    std::move(callback).Run(base::MakeRefCounted<base::RefCountedString>(
+        BuildSummaryDocument(entry->summary)));
+    SummaryRegistry::GetOrCreate(profile).Erase(token);
+    return;
+  }
+
+  // Still waiting on the model. Hold the callback; OnSummaryReady() runs it.
+  entry->waiting = std::move(callback);
+}
+
 void HandleRequest(Profile* profile,
-                   const std::string& /*path*/,
+                   const std::string& path,
                    content::WebUIDataSource::GotDataCallback callback) {
+  // Two documents come from this one filter: the tab list at any other path,
+  // and the summary fragment at "summary". ShouldHandleRequest() answers every
+  // path unconditionally, so this branch is the whole routing table.
+  if (base::StartsWith(path, "summary", base::CompareCase::SENSITIVE)) {
+    HandleSummaryRequest(profile, path, std::move(callback));
+    return;
+  }
+
   // Profile scoping. ProfileBrowserCollection is per-profile, so an Incognito
   // window's floating window lists only Incognito tabs and a regular window's
   // lists only regular ones. That falls out of the data source being registered
@@ -609,6 +882,33 @@ void HandleRequest(Profile* profile,
   auto collector = base::MakeRefCounted<OutlineCollector>(std::move(tabs),
                                                           std::move(callback));
 
+  // The summary, if it is switched on and this is not Incognito. The token is
+  // minted now so the <iframe> element can carry it, but the request itself
+  // cannot start until the headings exist -- which is what set_on_finished()
+  // below waits for.
+  if (floating_window::FloatingWindowSummarizer::IsAvailable() &&
+      !profile->IsOffTheRecord()) {
+    const std::string token = base::UnguessableToken::Create().ToString();
+    collector->set_summary_frame(
+        base::StringPrintf(kSummaryFrameFormat, ("summary?" + token).c_str()));
+    collector->set_on_finished(base::BindOnce(
+        [](Profile* profile, std::string token,
+           const OutlineCollector& finished) {
+          SummaryRegistry::Entry& entry =
+              SummaryRegistry::GetOrCreate(profile).Create(token);
+          entry.summarizer =
+              std::make_unique<floating_window::FloatingWindowSummarizer>();
+          // base::Unretained(profile) is safe for the same reason the request
+          // filter's bound Profile* is: this data source is owned by the
+          // URLDataManager keyed on that profile, so neither can outlive it.
+          entry.summarizer->Summarize(
+              profile, finished.BuildSummaryInput(),
+              base::BindOnce(&OnSummaryReady, base::Unretained(profile),
+                             std::move(token)));
+        },
+        base::Unretained(profile), token));
+  }
+
   // The "still issuing" count described on AddPending(). Dropped by the
   // ResolveOne() below, after every request is in flight — so a snapshot that
   // somehow completes inline cannot publish the page early, and a run with zero
@@ -665,6 +965,33 @@ FloatingWindowUI::FloatingWindowUI(content::WebUI* web_ui)
   // consumed by PopulateWebUIResources() for the LocalResourceLoaderConfig
   // path; StartDataRequest() never reads it. The request filter is the path
   // that is honoured unconditionally.
+  // The summary is served into a same-origin <iframe>, and two separate
+  // defaults stand in the way of that: frame-src defaults to 'none' for a
+  // WebUI source, and so does frame-ancestors.
+  //
+  // The trap is DisableDenyXFrameOptions(), which is *not* called here and must
+  // not be. It looks like the belt-and-braces companion to AddFrameAncestor()
+  // -- the header even comments it as "deprecated and AddFrameAncestors should
+  // be used instead", which reads as though both were needed until the
+  // deprecation lands. Calling it does the opposite of helping:
+  // url_data_manager_backend.cc:207 appends the frame-ancestors directive
+  // *only if* ShouldDenyXFrameOptions() is true, so disabling XFO silently
+  // drops frame-ancestors from the response as well, and AddFrameAncestor()
+  // above becomes dead code. What is left is a document with neither
+  // protection, embeddable by any chrome:// page.
+  //
+  // AddFrameAncestor() alone is sufficient, and the reason is one level down:
+  // X-Frame-Options: DENY is still sent, but AncestorThrottle checks the two
+  // against each other and returns PROCEED when a frame-ancestors CSP is
+  // present (ancestor_throttle.cc:264, per
+  // https://www.w3.org/TR/CSP/#frame-ancestors-and-frame-options). The CSP then
+  // decides, and it names this host.
+  const GURL host(chrome::kChromeUIFloatingWindowURL);
+  source->OverrideContentSecurityPolicy(
+      network::mojom::CSPDirectiveName::FrameSrc,
+      base::StrCat({"frame-src ", host.spec(), ";"}));
+  source->AddFrameAncestor(host);
+
   source->SetRequestFilter(
       base::BindRepeating(&ShouldHandleRequest),
       base::BindRepeating(&HandleRequest, base::Unretained(profile)));

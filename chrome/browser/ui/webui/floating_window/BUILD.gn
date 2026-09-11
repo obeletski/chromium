@@ -6,6 +6,8 @@ assert(is_win || is_mac || is_linux || is_chromeos)
 
 source_set("floating_window") {
   sources = [
+    "floating_window_summarizer.cc",
+    "floating_window_summarizer.h",
     "floating_window_ui.cc",
     "floating_window_ui.h",
   ]
@@ -33,6 +35,16 @@ source_set("floating_window") {
     # headers directly: WrapCallbackWithDefaultInvokeIfNotRun for the snapshot
     # replies, and AXTreeUpdate/AXNodeData for reading headings out of them.
     "//mojo/public/cpp/bindings",
+
+    # The summarizer's HTTP client, its API key, and the feature flag that
+    # gates it. //services/network/public/cpp for SimpleURLLoader,
+    # //google_apis for the GOOGLE_API_KEY fallback, and //chrome/browser/ui
+    # for the BASE_FEATURE_PARAM carrying the key.
+    "//chrome/browser/ui:ui_features",
+    "//google_apis",
+    "//net/traffic_annotation",
+    "//services/network/public/cpp",
+    "//services/network/public/mojom",
     "//ui/accessibility:ax_base",
     "//url",
   ]

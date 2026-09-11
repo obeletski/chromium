@@ -352,6 +352,13 @@ BASE_DECLARE_FEATURE(kAndroidAnimatedProgressBarInBrowser);
 bool IsAndroidAnimatedProgressBarInBrowserEnabled();
 #endif  // BUILDFLAG(IS_ANDROID)
 
+// Adds a model-generated summary of the open tabs to the floating window. Off
+// by default; needs an API key, either via the api_key param or the
+// GOOGLE_API_KEY environment variable in an unbranded build. See
+// docs/floating_window/floating-window-ai-summary-alternatives.md.
+BASE_DECLARE_FEATURE(kFloatingWindowSummary);
+BASE_DECLARE_FEATURE_PARAM(std::string, kFloatingWindowSummaryApiKey);
+
 BASE_DECLARE_FEATURE(kAiOverlayDialog);
 BASE_DECLARE_FEATURE_PARAM(std::string, kAiOverlayDialogApiKey);
 BASE_DECLARE_FEATURE_PARAM(std::string, kAiOverlayDialogMockJsonPath);

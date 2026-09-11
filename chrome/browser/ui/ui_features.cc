@@ -483,6 +483,13 @@ bool IsAndroidAnimatedProgressBarInBrowserEnabled() {
 // Note: This feature is meant for prototyping and takes shortcuts that mean it
 // cannot be put into production in its current state. Do not enable.
 // crbug.com/502801064
+BASE_FEATURE(kFloatingWindowSummary, base::FEATURE_DISABLED_BY_DEFAULT);
+BASE_FEATURE_PARAM(std::string,
+                   kFloatingWindowSummaryApiKey,
+                   &kFloatingWindowSummary,
+                   "api_key",
+                   "");
+
 BASE_FEATURE(kAiOverlayDialog, base::FEATURE_DISABLED_BY_DEFAULT);
 BASE_FEATURE_PARAM(std::string,
                    kAiOverlayDialogApiKey,

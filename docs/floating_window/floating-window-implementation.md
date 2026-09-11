@@ -11,6 +11,15 @@ document only covers what was built.
 > response is produced asynchronously. That mechanism has its own walkthrough,
 > diagram-heavy, in
 > [`floating-window-page-outlines.md`](floating-window-page-outlines.md).
+>
+> A model-generated summary of those tabs is served *beneath* the table, into a
+> same-origin `<iframe>` with its own request and its own `GotDataCallback`, so
+> the tab list never waits on a network round trip. That has its own walkthrough
+> too — the findings, the limitations, and in its appendix the options that were
+> weighed — in
+> [`floating-window-tab-summary.md`](floating-window-tab-summary.md).
+> It is off by default, and with the flag off this document describes the page
+> exactly.
 
 > **Source links.** Every path below links into
 > [github.com/obeletski/chromium](https://github.com/obeletski/chromium) on the
@@ -58,6 +67,7 @@ enabled by default.
 | `chrome/browser/ui/views/floating_window/`<br/>[`floating_window_bubble.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/floating_window/floating_window_bubble.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/floating_window/floating_window_bubble.cc) | `floating_window::CreateAndShow()` — builds the bubble around a `views::WebView` |
 | `chrome/browser/ui/views/toolbar/`<br/>[`floating_window_toolbar_button.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/floating_window_toolbar_button.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/floating_window_toolbar_button.cc) | the `ToolbarButton`; owns the toggle state |
 | `chrome/browser/ui/views/toolbar/`<br/>[`toolbar_view.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/toolbar_view.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/views/toolbar/toolbar_view.cc) | creates the button at the right position |
+| `chrome/browser/ui/webui/floating_window/`<br/>[`floating_window_summarizer.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_summarizer.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/webui/floating_window/floating_window_summarizer.cc) | the optional AI summary — the only part of the feature that touches the network |
 | `chrome/browser/ui/`<br/>[`ui_features.h`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/ui_features.h) · [`.cc`](https://github.com/obeletski/chromium/blob/floating-window/chrome/browser/ui/ui_features.cc) | the feature flag |
 | [`ui/enums.xml`](https://github.com/obeletski/chromium/blob/floating-window/tools/metrics/histograms/metadata/ui/enums.xml) · [`page/histograms.xml`](https://github.com/obeletski/chromium/blob/floating-window/tools/metrics/histograms/metadata/page/histograms.xml) | required metrics registration for a new WebUI host (§7) |
 
@@ -1141,3 +1151,9 @@ after load, and without it the PDF can be printed while they are still empty.
   WebUI-host registration, not to record how often the button is pressed.
 - **Not user-pinnable.** A deliberate consequence of choosing a hardcoded child
   over an `ActionItem`; see the alternatives doc, §A1 vs §A2.
+- **Three CSP defaults are relaxed on the shared data source** so the summary
+  can be framed: `frame-src`, `frame-ancestors` and `X-Frame-Options`. The
+  source serves every path under this host, so the relaxation applies to every
+  response it produces, not only to the framed one. The summary's own gaps are
+  in §12 of
+  [`floating-window-tab-summary.md`](floating-window-tab-summary.md).
