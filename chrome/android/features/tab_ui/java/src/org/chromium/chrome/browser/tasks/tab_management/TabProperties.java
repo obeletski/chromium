@@ -55,6 +55,7 @@ public class TabProperties {
         UiType.TAB_GROUP_SUGGESTION_MESSAGE,
         UiType.IPH_MESSAGE,
         UiType.COLLABORATION_ACTIVITY_MESSAGE,
+        UiType.TAB_SUMMARY_MESSAGE,
         UiType.PINNED_TAB
     })
     @Retention(RetentionPolicy.SOURCE)
@@ -71,7 +72,14 @@ public class TabProperties {
         int TAB_GROUP_SUGGESTION_MESSAGE = 7;
         int IPH_MESSAGE = 8;
         int COLLABORATION_ACTIVITY_MESSAGE = 9;
+
         int PINNED_TAB = 10;
+
+        // Deliberately not contiguous with the message cards above: UiTypeHelper.isMessageCard()
+        // classifies by `type >= PRICE_MESSAGE` rather than by listing members, so a new message
+        // card has to sort above every non-message type. Taking 11 keeps that true without
+        // renumbering PINNED_TAB, which would be a wider change for no gain.
+        int TAB_SUMMARY_MESSAGE = 11;
     }
 
     /** IDs for possible tab action states. */

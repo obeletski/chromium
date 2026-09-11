@@ -77,6 +77,7 @@ public class TabSwitcherMessageManager {
         MessageType.ARCHIVED_TABS_IPH_MESSAGE,
         MessageType.COLLABORATION_ACTIVITY,
         MessageType.TAB_GROUP_SUGGESTION_MESSAGE,
+        MessageType.TAB_SUMMARY_MESSAGE,
         MessageType.ALL
     })
     @Retention(RetentionPolicy.SOURCE)
@@ -90,7 +91,10 @@ public class TabSwitcherMessageManager {
         int ARCHIVED_TABS_IPH_MESSAGE = 5;
         int COLLABORATION_ACTIVITY = 6;
         int TAB_GROUP_SUGGESTION_MESSAGE = 7;
-        int ALL = 8;
+        int TAB_SUMMARY_MESSAGE = 8;
+
+        // Sentinel meaning "any message"; keep last.
+        int ALL = 9;
     }
 
     /** Used to observe updates to message cards. */
@@ -346,6 +350,11 @@ public class TabSwitcherMessageManager {
                         mActivity, this::getCurrentProfile, mTabGridIphDialogCoordinator);
         mMessageCardProvider.subscribeMessageService(iphMessageService);
 
+        // The tab summary card. Subscribing is all that is required: the provider calls
+        // initialize() on the service, which queues its one message, and registers the card's
+        // layout and binder with the TabListCoordinator through MessageHostDelegateFactory.
+        mMessageCardProvider.subscribeMessageService(new TabSummaryMessageService(mActivity));
+
         if (IncognitoReauthManager.isIncognitoReauthFeatureAvailable()
                 && mIncognitoReauthPromoMessageService == null) {
             IncognitoReauthManager incognitoReauthManager =
@@ -471,12 +480,19 @@ public class TabSwitcherMessageManager {
                     tabListCoordinator.getPriceWelcomeMessageInsertionIndex(),
                     UiType.PRICE_MESSAGE,
                     nextMessage.model);
-            case MessageType.ARCHIVED_TABS_MESSAGE -> tabListCoordinator.addSpecialListItem(
-                    0, UiType.ARCHIVED_TABS_MESSAGE, nextMessage.model);
-            default -> tabListCoordinator.addSpecialListItem(
-                    tabListCoordinator.getTabListModelSize(),
-                    messageTypeToUiType(messageType),
-                    nextMessage.model);
+            case MessageType.ARCHIVED_TABS_MESSAGE ->
+                    tabListCoordinator.addSpecialListItem(
+                            0, UiType.ARCHIVED_TABS_MESSAGE, nextMessage.model);
+            // Above the first row of thumbnails, not after the tabs, which is what makes this
+            // a header card rather than one more message in the list.
+            case MessageType.TAB_SUMMARY_MESSAGE ->
+                    tabListCoordinator.addSpecialListItem(
+                            0, UiType.TAB_SUMMARY_MESSAGE, nextMessage.model);
+            default ->
+                    tabListCoordinator.addSpecialListItem(
+                            tabListCoordinator.getTabListModelSize(),
+                            messageTypeToUiType(messageType),
+                            nextMessage.model);
         }
         for (MessageUpdateObserver observer : mObservers) {
             observer.onAppendedMessage();
@@ -504,11 +520,17 @@ public class TabSwitcherMessageManager {
                         continue;
                     }
                 }
-                    // Always add the archived tabs message to the start.
-                case MessageType.ARCHIVED_TABS_MESSAGE -> tabListCoordinator.addSpecialListItem(
-                        0, UiType.ARCHIVED_TABS_MESSAGE, message.model);
-                default -> tabListCoordinator.addSpecialListItem(
-                        index, messageTypeToUiType(messageType), message.model);
+                // Always add the archived tabs message to the start.
+                case MessageType.ARCHIVED_TABS_MESSAGE ->
+                        tabListCoordinator.addSpecialListItem(
+                                0, UiType.ARCHIVED_TABS_MESSAGE, message.model);
+                // Likewise the summary card: it is a header, so index 0 rather than `index`.
+                case MessageType.TAB_SUMMARY_MESSAGE ->
+                        tabListCoordinator.addSpecialListItem(
+                                0, UiType.TAB_SUMMARY_MESSAGE, message.model);
+                default ->
+                        tabListCoordinator.addSpecialListItem(
+                                index, messageTypeToUiType(messageType), message.model);
             }
             index++;
             sAppendedMessagesForTesting = true;

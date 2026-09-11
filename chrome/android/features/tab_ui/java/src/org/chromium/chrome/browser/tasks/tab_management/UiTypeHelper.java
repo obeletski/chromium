@@ -25,7 +25,9 @@ public class UiTypeHelper {
                     UiType.ARCHIVED_TABS_MESSAGE,
                     UiType.TAB_GROUP_SUGGESTION_MESSAGE,
                     UiType.IPH_MESSAGE,
-                    UiType.COLLABORATION_ACTIVITY_MESSAGE -> true;
+                    UiType.COLLABORATION_ACTIVITY_MESSAGE,
+                    UiType.TAB_SUMMARY_MESSAGE ->
+                    true;
             default -> false;
         };
     }
@@ -59,12 +61,13 @@ public class UiTypeHelper {
         return switch (type) {
             case MessageType.IPH -> UiType.IPH_MESSAGE;
             case MessageType.PRICE_MESSAGE -> UiType.PRICE_MESSAGE;
-            case MessageType.INCOGNITO_REAUTH_PROMO_MESSAGE -> UiType
-                    .INCOGNITO_REAUTH_PROMO_MESSAGE;
+            case MessageType.INCOGNITO_REAUTH_PROMO_MESSAGE ->
+                    UiType.INCOGNITO_REAUTH_PROMO_MESSAGE;
             case MessageType.ARCHIVED_TABS_MESSAGE -> UiType.ARCHIVED_TABS_MESSAGE;
             case MessageType.ARCHIVED_TABS_IPH_MESSAGE -> UiType.ARCHIVED_TABS_IPH_MESSAGE;
             case MessageType.COLLABORATION_ACTIVITY -> UiType.COLLABORATION_ACTIVITY_MESSAGE;
             case MessageType.TAB_GROUP_SUGGESTION_MESSAGE -> UiType.TAB_GROUP_SUGGESTION_MESSAGE;
+            case MessageType.TAB_SUMMARY_MESSAGE -> UiType.TAB_SUMMARY_MESSAGE;
             default -> throw new IllegalArgumentException();
         };
     }
