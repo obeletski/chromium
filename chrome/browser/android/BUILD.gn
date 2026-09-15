@@ -481,6 +481,7 @@ if (is_android) {
       "//chrome/browser/android/metrics:jni_headers",
       "//chrome/browser/android/omnibox",
       "//chrome/browser/android/omnibox:impl",
+      "//chrome/browser/android/tab_outline",
       "//chrome/browser/autofill/android:jni_headers",
       "//chrome/browser/auxiliary_search",
       "//chrome/browser/auxiliary_search:impl",

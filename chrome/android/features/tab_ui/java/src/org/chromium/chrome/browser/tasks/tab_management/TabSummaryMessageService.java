@@ -20,9 +20,12 @@ import org.chromium.chrome.browser.tasks.tab_management.MessageCardViewPropertie
 import org.chromium.chrome.browser.tasks.tab_management.TabProperties.UiType;
 import org.chromium.chrome.browser.tasks.tab_management.TabSwitcherMessageManager.MessageType;
 import org.chromium.chrome.tab_ui.R;
+import org.chromium.content_public.browser.WebContents;
 import org.chromium.ui.modelutil.PropertyModel;
 import org.chromium.url.GURL;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.Supplier;
 
 /**
@@ -55,7 +58,7 @@ public class TabSummaryMessageService
     // How many tabs the card will name before it stops and counts the rest. A phone can easily
     // carry dozens of tabs, and this card sits above the grid -- letting it grow without bound
     // would push every thumbnail off screen, which is the one thing the design forbids.
-    private static final int MAX_LINES = 8;
+    private static final int MAX_TABS = 6;
 
     // TODO: Replace this listing with the model's summary once the Android side can reach one.
     // Listing the tabs is scaffolding: it proves the card can read real state and re-render,
@@ -66,12 +69,17 @@ public class TabSummaryMessageService
     // See CLAUDE.md, "Why this checkout exists".
     private static final String EMPTY_TEXT = "No open tabs.";
     private static final String UNTITLED_TEXT = "(untitled)";
+    private static final String NOT_LOADED_TEXT = "    (not loaded)";
+    private static final String NO_HEADINGS_TEXT = "    (no headings)";
 
     private final Context mContext;
     private final Supplier<@Nullable TabModel> mTabModelSupplier;
 
     // The model behind the card, kept so the text can be rewritten after the fact. See refresh().
     private @Nullable PropertyModel mModel;
+
+    // Incremented by each refresh() so that replies from a superseded gather can be dropped.
+    private int mGeneration;
 
     /**
      * @param context Used only to resolve the dismiss button's content description.
@@ -108,59 +116,115 @@ public class TabSummaryMessageService
     }
 
     /**
-     * Rewrites the card's text from the current tab model.
+     * Rewrites the card's text from the current tab model, asking each loaded tab's renderer for
+     * its h1/h2 headings.
      *
-     * <p>This exists because of when the model is built. {@link MessageService#queueMessage} runs
-     * its factory immediately, and the only safe moment to queue is {@link #initialize}, which
-     * happens during subscription -- long before any tab is loaded into the switcher. The card's
-     * text therefore cannot be correct at construction time, and has to be written again once the
-     * tabs exist.
+     * <p>Two reasons this is not a simple getter. First, the model is built at {@link #initialize}
+     * -- {@link MessageService#queueMessage} runs its factory immediately, and initialize() happens
+     * during subscription, long before a tab is loaded -- so the text cannot be correct at
+     * construction. Second, headings are not browser-side state: each one costs a round trip to a
+     * renderer through {@link TabOutlineBridge}, so the text is assembled asynchronously and
+     * written when the last reply lands.
      *
-     * <p>Updating {@code DESCRIPTION_TEXT} on the live model is enough to redraw: it is a writable
-     * property key, so the {@code PropertyModelChangeProcessor} calls {@code MessageCardViewBinder}
-     * for that key alone and the view updates in place. There is no need to remove and re-add the
-     * card, which would also lose its position.
-     *
-     * <p>Called from {@code TabSwitcherMessageManager#afterReset}, the point at which the grid has
-     * just been populated and the tab count is known.
+     * <p>Setting {@code DESCRIPTION_TEXT} on the live model is enough to redraw. It is a writable
+     * key, so the change processor calls {@code MessageCardViewBinder} for that key alone and the
+     * view updates in place, keeping the card's position -- removing and re-adding would lose it.
      */
     public void refresh() {
         if (mModel == null) return;
-        mModel.set(MessageCardViewProperties.DESCRIPTION_TEXT, buildText());
-    }
 
-    /** One line per tab: its title, or its URL when the title is empty. */
-    private String buildText() {
         TabModel tabModel = mTabModelSupplier.get();
         if (tabModel == null || tabModel.getCount() == 0) {
-            return EMPTY_TEXT;
+            mModel.set(MessageCardViewProperties.DESCRIPTION_TEXT, EMPTY_TEXT);
+            return;
         }
 
         int total = tabModel.getCount();
-        int shown = Math.min(total, MAX_LINES);
-        StringBuilder text = new StringBuilder();
+        int shown = Math.min(total, MAX_TABS);
+
+        // One slot per tab, filled in as replies arrive. Indexing by position rather than
+        // appending is what keeps the output in tab order: the renderers answer in whatever order
+        // they please, and a page with no headings answers instantly while a heavy one does not.
+        List<String @Nullable []> outlines = new ArrayList<>();
+        List<String> titles = new ArrayList<>();
         for (int i = 0; i < shown; i++) {
-            // getTabAt() is documented @Nullable; a tab can disappear between the count and the
-            // read, so skipping is the only correct response.
+            outlines.add(null);
+            titles.add("");
+        }
+
+        // Counts replies still outstanding. Starts at one extra so that a tab answering
+        // synchronously -- which the null-WebContents path does -- cannot drive the count to zero
+        // and publish a half-issued listing before the loop has finished. Released after the loop.
+        // The desktop OutlineCollector holds the same extra count for the same reason.
+        int[] pending = new int[] {1};
+        // Guards against a late reply writing into a listing that has been superseded by a newer
+        // refresh(). Without it, switching panes twice in quick succession interleaves two gathers.
+        final int generation = ++mGeneration;
+
+        for (int i = 0; i < shown; i++) {
             Tab tab = tabModel.getTabAt(i);
             if (tab == null) continue;
-            if (text.length() > 0) text.append('\n');
-            text.append(lineFor(tab));
+            titles.set(i, titleFor(tab));
+
+            WebContents webContents = tab.getWebContents();
+            if (webContents == null) {
+                // Ordinary on Android: a backgrounded tab is frequently discarded, and a tab
+                // restored from disk has never had a renderer this session. There is nothing to
+                // ask, so say so rather than leaving the tab looking heading-less.
+                outlines.set(i, new String[] {NOT_LOADED_TEXT});
+                continue;
+            }
+
+            final int index = i;
+            pending[0]++;
+            TabOutlineBridge.requestOutline(
+                    webContents,
+                    headings -> {
+                        if (generation != mGeneration) return;
+                        outlines.set(index, headings);
+                        if (--pending[0] == 0) publish(titles, outlines, total, shown);
+                    });
         }
-        if (total > shown) {
-            text.append('\n').append("+ ").append(total - shown).append(" more");
-        }
-        return text.toString();
+
+        pending[0]--;
+        if (pending[0] == 0) publish(titles, outlines, total, shown);
     }
 
-    private String lineFor(Tab tab) {
+    /** Composes the finished listing and writes it to the card. */
+    private void publish(
+            List<String> titles, List<String @Nullable []> outlines, int total, int shown) {
+        if (mModel == null) return;
+
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; i < shown; i++) {
+            if (text.length() > 0) text.append('\n');
+            text.append(titles.get(i));
+
+            String @Nullable [] headings = outlines.get(i);
+            if (headings == null || headings.length == 0) {
+                // Empty covers both "page has no h1/h2" and "the renderer did not answer inside
+                // the snapshot timeout". The bridge cannot tell them apart, so neither can this.
+                text.append('\n').append(NO_HEADINGS_TEXT);
+                continue;
+            }
+            for (String heading : headings) {
+                text.append('\n').append("    ").append(heading);
+            }
+        }
+        if (total > shown) {
+            text.append('\n').append("+ ").append(total - shown).append(" more tabs");
+        }
+        mModel.set(MessageCardViewProperties.DESCRIPTION_TEXT, text.toString());
+    }
+
+    /** The tab's title, or its URL where the title is empty. */
+    private String titleFor(Tab tab) {
         String title = tab.getTitle();
         if (!TextUtils.isEmpty(title)) {
             return title;
         }
-        // No title yet -- a tab restored from disk and not loaded has none. The URL is the next
-        // best identifier, and the spec is used rather than the host so that two tabs on the same
-        // site stay distinguishable.
+        // A tab restored from disk and not loaded has no title. The URL is the next best
+        // identifier, and the spec rather than the host so two tabs on one site stay distinct.
         GURL url = tab.getUrl();
         return (url == null || url.getSpec().isEmpty()) ? UNTITLED_TEXT : url.getSpec();
     }
@@ -215,7 +279,7 @@ public class TabSummaryMessageService
                                 this::onDismissed)
                         // Correct as of now, which is usually "no tabs"; refresh() writes the real
                         // listing once the grid has been populated.
-                        .with(MessageCardViewProperties.DESCRIPTION_TEXT, buildText())
+                        .with(MessageCardViewProperties.DESCRIPTION_TEXT, EMPTY_TEXT)
                         // No action button: there is nothing to accept or review yet. The property
                         // has to
                         // be set explicitly -- ALL_KEYS leaves it false-by-default only because
