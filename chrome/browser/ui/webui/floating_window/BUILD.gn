@@ -2,50 +2,80 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
-assert(is_win || is_mac || is_linux || is_chromeos)
-
-source_set("floating_window") {
+# Deliberately not behind the desktop guard below, and the only target here that
+# is not. The summarizer is plain browser-process code -- a Profile, a
+# SimpleURLLoader, an API key and a prompt -- with nothing platform-specific in
+# it, and the Android tab summary card is its second caller
+# (//chrome/browser/android/tab_summary).
+#
+# It keeps its path rather than moving somewhere platform-neutral because the
+# write-ups in docs/floating_window/ cite this file by line number; see "Why the
+# summarizer did not move" in tab-summary-android-ui-alternatives.md for the
+# trade that was made and when to revisit it.
+source_set("summarizer") {
   sources = [
     "floating_window_summarizer.cc",
     "floating_window_summarizer.h",
-    "floating_window_ui.cc",
-    "floating_window_ui.h",
   ]
-  public_deps = [
-    "//chrome/common",
-    "//content/public/browser",
-  ]
+
+  # Profile is in the signature of Summarize(), so it is part of this target's
+  # interface rather than an implementation detail.
+  public_deps = [ "//chrome/browser/profiles:profile" ]
+
   deps = [
     "//base",
-    "//chrome/browser/profiles:profile",
 
-    # ProfileBrowserCollection / BrowserWindowInterface, for enumerating the
-    # profile's browser windows, and TabStripModel for their tabs. Depending
-    # back on these from a //chrome/browser/ui/webui source_set is normal --
-    # //chrome/browser/ui/browser_window is deliberately dependency-free within
-    # //chrome so that features can point at it without cycles (see the comment
-    # atop its BUILD.gn). //chrome/browser/ui/webui:chrome_web_contents_handler
-    # is the nearest precedent, with the same pair of deps.
-    "//chrome/browser/ui/browser_window",
-    "//chrome/browser/ui/tabs:tab_strip",
-    "//content/public/common",
-
-    # Reached transitively through //content/public/browser today, so gn check
-    # passes without them. Listed anyway because this target includes their
-    # headers directly: WrapCallbackWithDefaultInvokeIfNotRun for the snapshot
-    # replies, and AXTreeUpdate/AXNodeData for reading headings out of them.
-    "//mojo/public/cpp/bindings",
-
-    # The summarizer's HTTP client, its API key, and the feature flag that
-    # gates it. //services/network/public/cpp for SimpleURLLoader,
-    # //google_apis for the GOOGLE_API_KEY fallback, and //chrome/browser/ui
-    # for the BASE_FEATURE_PARAM carrying the key.
+    # The BASE_FEATURE_PARAM carrying the API key, and the flag that gates the
+    # whole feature.
     "//chrome/browser/ui:ui_features",
+
+    # StoragePartition, for the profile's URLLoaderFactory.
+    "//content/public/browser",
+
+    # The GOOGLE_API_KEY fallback.
     "//google_apis",
     "//net/traffic_annotation",
     "//services/network/public/cpp",
     "//services/network/public/mojom",
-    "//ui/accessibility:ax_base",
     "//url",
   ]
+}
+
+# The WebUI host and everything that enumerates desktop browser windows.
+if (is_win || is_mac || is_linux || is_chromeos) {
+  source_set("floating_window") {
+    sources = [
+      "floating_window_ui.cc",
+      "floating_window_ui.h",
+    ]
+    public_deps = [
+      "//chrome/common",
+      "//content/public/browser",
+    ]
+    deps = [
+      ":summarizer",
+      "//base",
+      "//chrome/browser/profiles:profile",
+
+      # ProfileBrowserCollection / BrowserWindowInterface, for enumerating the
+      # profile's browser windows, and TabStripModel for their tabs. Depending
+      # back on these from a //chrome/browser/ui/webui source_set is normal --
+      # //chrome/browser/ui/browser_window is deliberately dependency-free
+      # within //chrome so that features can point at it without cycles (see the
+      # comment atop its BUILD.gn). //chrome/browser/ui/webui:
+      # chrome_web_contents_handler is the nearest precedent, with the same pair
+      # of deps.
+      "//chrome/browser/ui/browser_window",
+      "//chrome/browser/ui/tabs:tab_strip",
+      "//content/public/common",
+
+      # Reached transitively through //content/public/browser today, so gn check
+      # passes without them. Listed anyway because this target includes their
+      # headers directly: WrapCallbackWithDefaultInvokeIfNotRun for the snapshot
+      # replies, and AXTreeUpdate/AXNodeData for reading headings out of them.
+      "//mojo/public/cpp/bindings",
+      "//ui/accessibility:ax_base",
+      "//url",
+    ]
+  }
 }

@@ -4,6 +4,7 @@
 
 package org.chromium.chrome.browser.tasks.tab_management;
 
+import static org.chromium.build.NullUtil.assumeNonNull;
 import static org.chromium.chrome.browser.tasks.tab_management.TabListModel.CardProperties.CARD_ALPHA;
 import static org.chromium.chrome.browser.tasks.tab_management.TabListModel.CardProperties.CARD_TYPE;
 import static org.chromium.chrome.browser.tasks.tab_management.TabListModel.CardProperties.ModelType.MESSAGE;
@@ -13,6 +14,7 @@ import android.text.TextUtils;
 
 import org.chromium.build.annotations.NullMarked;
 import org.chromium.build.annotations.Nullable;
+import org.chromium.chrome.browser.profiles.Profile;
 import org.chromium.chrome.browser.tab.Tab;
 import org.chromium.chrome.browser.tabmodel.TabModel;
 import org.chromium.chrome.browser.tasks.tab_management.MessageCardView.ServiceDismissActionProvider;
@@ -35,10 +37,13 @@ import java.util.function.Supplier;
  * summary appears where the user is already asking the question it answers, with the tabs it
  * describes on the same screen.
  *
- * <p><b>First step only.</b> The text is a hardcoded placeholder. Nothing here talks to a model
- * yet; the browser-process summarizer that produces the real text on desktop ({@code
- * FloatingWindowSummarizer}) is reusable as-is, and wiring it up means a JNI hop and a heading
- * source on Android, neither of which exists. See the TODO on {@link #PLACEHOLDER_TEXT}.
+ * <p><b>What the card shows, in order of preference.</b> When {@link TabSummaryBridge#isAvailable}
+ * is true -- the {@code FloatingWindowSummary} flag is on and an API key is configured -- the card
+ * shows a model-written summary of the open tabs, produced by the same browser-process summarizer
+ * the desktop floating window uses. Otherwise, and on any failure, it falls back to listing the
+ * tabs and their h1/h2 headings through {@link TabOutlineBridge}. The listing is what the feature
+ * was before the model call existed; keeping it as the fallback means a build with no key still
+ * shows something true rather than an error.
  *
  * <p>Why a {@link MessageService} rather than a view added to the pane's layout: the tab switcher
  * is a {@code RecyclerView}, and a card added outside it would not scroll with the grid, would not
@@ -68,6 +73,15 @@ public class TabSummaryMessageService
     // string needs a translation screenshot that presubmit blocks on, and none of this will ship.
     // See CLAUDE.md, "Why this checkout exists".
     private static final String EMPTY_TEXT = "No open tabs.";
+    private static final String SUMMARISING_TEXT = "Summarising your tabs...";
+
+    // Prefixes the model's prose, and only the model's prose. The card has no title and no icon,
+    // and the two things it can show -- a written summary and the heading listing -- are both
+    // plain text in the same slot, so nothing on screen says which branch of refresh() produced
+    // what is there. That matters because the fallback is silent by design: a missing key or a
+    // failed request lands on listHeadings() without an error, and a reader who does not already
+    // know the feature reads the listing as the summary having done a poor job.
+    private static final String SUMMARY_PREFIX = "Summary: ";
     private static final String UNTITLED_TEXT = "(untitled)";
     private static final String NOT_LOADED_TEXT = "    (not loaded)";
     private static final String NO_HEADINGS_TEXT = "    (no headings)";
@@ -116,15 +130,19 @@ public class TabSummaryMessageService
     }
 
     /**
-     * Rewrites the card's text from the current tab model, asking each loaded tab's renderer for
-     * its h1/h2 headings.
+     * Rewrites the card's text from the current tab model.
      *
-     * <p>Two reasons this is not a simple getter. First, the model is built at {@link #initialize}
-     * -- {@link MessageService#queueMessage} runs its factory immediately, and initialize() happens
-     * during subscription, long before a tab is loaded -- so the text cannot be correct at
-     * construction. Second, headings are not browser-side state: each one costs a round trip to a
-     * renderer through {@link TabOutlineBridge}, so the text is assembled asynchronously and
-     * written when the last reply lands.
+     * <p>Two shapes, chosen by whether a model can be reached. With one, the tabs go to {@link
+     * TabSummaryBridge} and the card shows the prose that comes back. Without, the card falls back
+     * to listing the tabs and the h1/h2 headings gathered one tab at a time through {@link
+     * TabOutlineBridge}. The fallback also catches a request that was made and failed, so a dead
+     * network shows the listing rather than an error.
+     *
+     * <p>Neither shape is a simple getter. The model is built at {@link #initialize} -- {@link
+     * MessageService#queueMessage} runs its factory immediately, and initialize() happens during
+     * subscription, long before a tab is loaded -- so the text cannot be correct at construction.
+     * And headings are not browser-side state: each one costs a round trip to a renderer, so the
+     * text is assembled asynchronously and written when the last reply lands.
      *
      * <p>Setting {@code DESCRIPTION_TEXT} on the live model is enough to redraw. It is a writable
      * key, so the change processor calls {@code MessageCardViewBinder} for that key alone and the
@@ -139,6 +157,78 @@ public class TabSummaryMessageService
             return;
         }
 
+        // Guards against a late reply writing into a card that has been superseded by a newer
+        // refresh(). Without it, switching panes twice in quick succession interleaves two runs.
+        // Incremented once here, and passed down, so that a summary falling back to the listing
+        // does not invalidate its own continuation.
+        final int generation = ++mGeneration;
+
+        // isOffTheRecord() is belt-and-braces: MessageCardScope.REGULAR already keeps this card out
+        // of the Incognito pane, and the native side CHECKs. Three layers, because the failure this
+        // prevents -- Incognito page headings reaching a remote endpoint -- is not recoverable.
+        if (TabSummaryBridge.isAvailable() && !tabModel.isOffTheRecord()) {
+            summarise(tabModel, generation);
+        } else {
+            listHeadings(tabModel, generation);
+        }
+    }
+
+    /** Asks the model to describe the tabs, and falls back to the listing if it cannot. */
+    private void summarise(TabModel tabModel, int generation) {
+        assumeNonNull(mModel);
+        Profile profile = tabModel.getProfile();
+        if (profile == null) {
+            listHeadings(tabModel, generation);
+            return;
+        }
+
+        // Every tab, not just the first MAX_TABS: the cap below is about how many lines the card
+        // can show, and the prompt has its own, larger cap (kMaxTabsToSnapshot, matching the
+        // summarizer's kMaxTabsInPrompt). A summary that silently described the first six of forty
+        // tabs would be wrong in a way the user could not see.
+        List<TabSummaryBridge.TabInfo> tabs = new ArrayList<>();
+        for (int i = 0; i < tabModel.getCount(); i++) {
+            Tab tab = tabModel.getTabAt(i);
+            if (tab == null) continue;
+            tabs.add(new TabSummaryBridge.TabInfo(titleFor(tab), tab.getWebContents()));
+        }
+        if (tabs.isEmpty()) {
+            mModel.set(MessageCardViewProperties.DESCRIPTION_TEXT, EMPTY_TEXT);
+            return;
+        }
+
+        // Write the waiting state before the request, not after: the round trip is a renderer
+        // snapshot plus a network call, which is seconds rather than frames, and the card would
+        // otherwise sit showing the previous run's text with no sign that anything is happening.
+        mModel.set(MessageCardViewProperties.DESCRIPTION_TEXT, SUMMARISING_TEXT);
+
+        TabSummaryBridge.requestSummary(
+                profile,
+                tabs,
+                summary -> {
+                    if (generation != mGeneration || mModel == null) return;
+                    if (summary == null) {
+                        // No key, no network, an API error, or a reply with nothing usable in it.
+                        // The bridge deliberately does not say which -- the details can carry quota
+                        // information and key fragments, and they are logged natively instead.
+                        listHeadings(tabModel, generation);
+                        return;
+                    }
+                    mModel.set(
+                            MessageCardViewProperties.DESCRIPTION_TEXT,
+                            SUMMARY_PREFIX + summary.trim());
+                });
+    }
+
+    /**
+     * Lists the tabs and their headings: the card's original behaviour, now the fallback.
+     *
+     * <p>Kept rather than replaced because it is the only view of what the summary was built from.
+     * When the prose is wrong, this is how to tell whether the model misread the headings or never
+     * got them.
+     */
+    private void listHeadings(TabModel tabModel, int generation) {
+        assumeNonNull(mModel);
         int total = tabModel.getCount();
         int shown = Math.min(total, MAX_TABS);
 
@@ -157,9 +247,6 @@ public class TabSummaryMessageService
         // and publish a half-issued listing before the loop has finished. Released after the loop.
         // The desktop OutlineCollector holds the same extra count for the same reason.
         int[] pending = new int[] {1};
-        // Guards against a late reply writing into a listing that has been superseded by a newer
-        // refresh(). Without it, switching panes twice in quick succession interleaves two gathers.
-        final int generation = ++mGeneration;
 
         for (int i = 0; i < shown; i++) {
             Tab tab = tabModel.getTabAt(i);

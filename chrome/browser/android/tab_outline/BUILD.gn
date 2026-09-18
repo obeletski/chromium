@@ -5,11 +5,15 @@
 import("//build/config/android/rules.gni")
 
 source_set("tab_outline") {
-  sources = [ "tab_outline_bridge.cc" ]
+  sources = [
+    "tab_outline.cc",
+    "tab_outline.h",
+    "tab_outline_bridge.cc",
+  ]
+  public_deps = [ "//ui/accessibility" ]
   deps = [
     "//base",
     "//chrome/android:chrome_jni_headers",
     "//content/public/browser",
-    "//ui/accessibility",
   ]
 }

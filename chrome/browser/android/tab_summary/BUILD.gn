@@ -1,0 +1,22 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/android/rules.gni")
+
+source_set("tab_summary") {
+  sources = [ "tab_summary_bridge.cc" ]
+  deps = [
+    "//base",
+    "//chrome/android:chrome_jni_headers",
+    "//chrome/browser/android/tab_outline",
+    "//chrome/browser/profiles:profile",
+
+    # The browser-process summarizer, shared with the desktop floating window.
+    # Its target is the one in that directory that is not desktop-gated.
+    "//chrome/browser/ui/webui/floating_window:summarizer",
+    "//content/public/browser",
+    "//mojo/public/cpp/bindings",
+    "//ui/accessibility",
+  ]
+}
